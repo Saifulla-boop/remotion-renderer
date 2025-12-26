@@ -4,6 +4,7 @@ import os from "os";
 import path from "path";
 import fs from "fs";
 import fsp from "fs/promises";
+import crypto from "crypto";
 import { bundle } from "@remotion/bundler";
 import { renderMedia, selectComposition } from "@remotion/renderer";
 import { google } from "googleapis";
@@ -22,7 +23,6 @@ function getDrive() {
     throw new Error("Missing GOOGLE_CLIENT_EMAIL / GOOGLE_PRIVATE_KEY env vars.");
   }
 
-  // Railway часто хранит многострочный ключ с \n — восстанавливаем переносы
   const key = keyRaw.replace(/\\n/g, "\n");
 
   const auth = new google.auth.JWT({
@@ -34,10 +34,6 @@ function getDrive() {
   return google.drive({ version: "v3", auth });
 }
 
-/**
- * Скачивает файл из Google Drive по fileId во временный путь.
- * ВАЖНО: файл/папка должны быть расшарены на сервисный аккаунт (Editor/Viewer достаточно на чтение).
- */
 async function downloadFromDrive(fileId, outPath) {
   const drive = getDrive();
 
@@ -54,16 +50,11 @@ async function downloadFromDrive(fileId, outPath) {
   return outPath;
 }
 
-/**
- * Загружает mp4 в папку DRIVE_FOLDER_ID и делает файл публичным.
- */
 async function uploadMp4ToDrive(localPath) {
   const drive = getDrive();
   const folderId = process.env.DRIVE_FOLDER_ID;
 
-  if (!folderId) {
-    throw new Error("Missing DRIVE_FOLDER_ID env var.");
-  }
+  if (!folderId) throw new Error("Missing DRIVE_FOLDER_ID env var.");
 
   const fileName = `short-${Date.now()}.mp4`;
 
@@ -81,17 +72,13 @@ async function uploadMp4ToDrive(localPath) {
   });
 
   const fileId = createRes.data.id;
-  if (!fileId) {
-    throw new Error("Drive upload failed: no fileId returned.");
-  }
+  if (!fileId) throw new Error("Drive upload failed: no fileId returned.");
 
-  // Make public
   await drive.permissions.create({
     fileId,
     requestBody: { type: "anyone", role: "reader" },
   });
 
-  // Direct download URL
   const mp4Url = `https://drive.google.com/uc?export=download&id=${fileId}`;
   return { mp4Url, fileId };
 }
@@ -101,13 +88,61 @@ let serveUrl = null;
 
 async function getBundle() {
   if (serveUrl) return serveUrl;
-
   serveUrl = await bundle({
     entryPoint: path.join(process.cwd(), "remotion", "src", "index.ts"),
   });
-
   return serveUrl;
 }
+
+// -------------------- Temporary asset registry (token -> file paths) --------------------
+/**
+ * token -> { videoPath: string, musicPath?: string, expiresAt: number }
+ */
+const ASSETS = new Map();
+
+function createToken() {
+  return crypto.randomBytes(16).toString("hex");
+}
+
+function registerAssets({ videoPath, musicPath }) {
+  const token = createToken();
+  // TTL 15 minutes
+  ASSETS.set(token, {
+    videoPath,
+    musicPath,
+    expiresAt: Date.now() + 15 * 60 * 1000,
+  });
+  return token;
+}
+
+function cleanupToken(token) {
+  ASSETS.delete(token);
+}
+
+// clean expired tokens every 2 minutes
+setInterval(() => {
+  const now = Date.now();
+  for (const [token, v] of ASSETS.entries()) {
+    if (v.expiresAt < now) ASSETS.delete(token);
+  }
+}, 2 * 60 * 1000);
+
+// Serve local temp files over HTTP so OffthreadVideo can read them
+app.get("/asset/:token/video", (req, res) => {
+  const token = req.params.token;
+  const entry = ASSETS.get(token);
+  if (!entry?.videoPath) return res.status(404).send("Not found");
+  res.setHeader("Content-Type", "video/mp4");
+  fs.createReadStream(entry.videoPath).pipe(res);
+});
+
+app.get("/asset/:token/music", (req, res) => {
+  const token = req.params.token;
+  const entry = ASSETS.get(token);
+  if (!entry?.musicPath) return res.status(404).send("Not found");
+  res.setHeader("Content-Type", "audio/mpeg");
+  fs.createReadStream(entry.musicPath).pipe(res);
+});
 
 // -------------------- Routes --------------------
 app.get("/health", (_, res) => res.json({ ok: true }));
@@ -117,8 +152,8 @@ app.get("/health", (_, res) => res.json({ ok: true }));
  * Body:
  * {
  *   "hook": "Почему нет продаж?",
- *   "videoFileId": "....",     // Google Drive fileId
- *   "musicFileId": "....",     // Google Drive fileId (optional)
+ *   "videoFileId": "...",   // required
+ *   "musicFileId": "...",   // optional
  *   "durationSec": 12
  * }
  */
@@ -126,22 +161,19 @@ app.post("/render", async (req, res) => {
   let localVideo = null;
   let localMusic = null;
   let outPath = null;
+  let token = null;
 
   try {
     const { hook, videoFileId, musicFileId, durationSec } = req.body || {};
-
-    if (!videoFileId) {
-      return res.status(400).json({ error: "videoFileId required" });
-    }
+    if (!videoFileId) return res.status(400).json({ error: "videoFileId required" });
 
     const duration = Number.isFinite(Number(durationSec))
       ? Math.min(Math.max(Number(durationSec), 6), 20)
       : 12;
 
-    // 1) Bundle Remotion once
     const serve = await getBundle();
 
-    // 2) Download assets from Drive to local temp files
+    // 1) Download inputs to /tmp
     localVideo = path.join(os.tmpdir(), `in-video-${Date.now()}.mp4`);
     await downloadFromDrive(videoFileId, localVideo);
 
@@ -150,11 +182,17 @@ app.post("/render", async (req, res) => {
       await downloadFromDrive(musicFileId, localMusic);
     }
 
-    // 3) Render using local file:// URLs (stable, no HTML/redirect issues)
+    // 2) Register temp assets and build local HTTP URLs
+    token = registerAssets({ videoPath: localVideo, musicPath: localMusic });
+
+    const baseUrl = `http://127.0.0.1:${PORT}`;
+    const videoUrl = `${baseUrl}/asset/${token}/video`;
+    const musicUrl = localMusic ? `${baseUrl}/asset/${token}/music` : "";
+
     const inputProps = {
       hook: String(hook ?? ""),
-      videoUrl: `file://${localVideo}`,
-      musicUrl: localMusic ? `file://${localMusic}` : "",
+      videoUrl,
+      musicUrl,
       durationSec: duration,
     };
 
@@ -164,6 +202,7 @@ app.post("/render", async (req, res) => {
       inputProps,
     });
 
+    // 3) Render mp4 to /tmp
     outPath = path.join(os.tmpdir(), `out-${Date.now()}.mp4`);
 
     await renderMedia({
@@ -178,7 +217,7 @@ app.post("/render", async (req, res) => {
       inputProps,
     });
 
-    // 4) Upload result to Drive (shorts_renders folder)
+    // 4) Upload output to Drive
     const { mp4Url, fileId } = await uploadMp4ToDrive(outPath);
 
     return res.json({ mp4_url: mp4Url, file_id: fileId });
@@ -186,7 +225,8 @@ app.post("/render", async (req, res) => {
     console.error(e);
     return res.status(500).json({ error: e?.message || "Render failed" });
   } finally {
-    // cleanup temp files
+    // 5) cleanup registry + files
+    if (token) cleanupToken(token);
     if (outPath) await fsp.unlink(outPath).catch(() => {});
     if (localVideo) await fsp.unlink(localVideo).catch(() => {});
     if (localMusic) await fsp.unlink(localMusic).catch(() => {});
