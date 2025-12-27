@@ -7,6 +7,7 @@ import fsp from "fs/promises";
 import crypto from "crypto";
 import { bundle } from "@remotion/bundler";
 import { renderMedia, selectComposition } from "@remotion/renderer";
+import { spawn } from "child_process";
 import { google } from "googleapis";
 
 const app = express();
@@ -120,6 +121,48 @@ app.get("/health", (_, res) => res.json({ ok: true }));
  *
  * Response: mp4 binary (video/mp4)
  */
+function run(cmd, args, { timeoutMs = 25000 } = {}) {
+  return new Promise((resolve, reject) => {
+    const p = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"] });
+
+    let out = "";
+    let err = "";
+
+    const t = setTimeout(() => {
+      p.kill("SIGKILL");
+      reject(new Error(`${cmd} timeout`));
+    }, timeoutMs);
+
+    p.stdout.on("data", (d) => (out += d.toString()));
+    p.stderr.on("data", (d) => (err += d.toString()));
+
+    p.on("close", (code) => {
+      clearTimeout(t);
+      if (code === 0) return resolve({ out, err });
+      reject(new Error(`${cmd} failed (${code})\n${err || out}`));
+    });
+  });
+}
+
+async function getVideoDims(filePath) {
+  // ffprobe: ширина/высота
+  const { out } = await run("ffprobe", [
+    "-v",
+    "error",
+    "-select_streams",
+    "v:0",
+    "-show_entries",
+    "stream=width,height",
+    "-of",
+    "csv=s=x:p=0",
+    filePath,
+  ]);
+
+  const [w, h] = out.trim().split("x").map(Number);
+  if (!w || !h) throw new Error("ffprobe could not read video dimensions");
+  return { w, h };
+}
+
 app.post("/render", async (req, res) => {
   let localVideo = null;
   let localMusic = null;
@@ -144,6 +187,66 @@ app.post("/render", async (req, res) => {
       localMusic = path.join(os.tmpdir(), `in-music-${Date.now()}.mp3`);
       await downloadFromDrive(musicFileId, localMusic);
     }
+    function parseLastCrop(lineText) {
+  // ищем строки типа: crop=1080:608:0:656
+  const matches = [...lineText.matchAll(/crop=(\d+):(\d+):(\d+):(\d+)/g)];
+  if (!matches.length) return null;
+  const m = matches[matches.length - 1];
+  return {
+    cw: Number(m[1]),
+    ch: Number(m[2]),
+    cx: Number(m[3]),
+    cy: Number(m[4]),
+  };
+}
+
+async function detectAutoZoom(filePath) {
+  const { w, h } = await getVideoDims(filePath);
+
+  // Берём короткий сэмпл, cropdetect находит полезную область (без чёрных полей)
+  // Чем выше limit/round — тем агрессивнее резка; эти значения обычно ок.
+  let crop = null;
+  try {
+    const { err } = await run("ffmpeg", [
+      "-hide_banner",
+      "-loglevel",
+      "info",
+      "-ss",
+      "0",
+      "-t",
+      "2",
+      "-i",
+      filePath,
+      "-vf",
+      "cropdetect=24:16:0",
+      "-f",
+      "null",
+      "-",
+    ]);
+
+    crop = parseLastCrop(err);
+  } catch (e) {
+    // Если cropdetect не сработал — просто не зумим
+    crop = null;
+  }
+
+  // Если crop не найден — зум 1
+  if (!crop?.cw || !crop?.ch) return { forceZoom: 1.0, meta: { w, h, crop: null } };
+
+  // Если crop почти равен кадру — значит чёрных полей нет
+  const sameW = crop.cw / w > 0.97;
+  const sameH = crop.ch / h > 0.97;
+  if (sameW && sameH) return { forceZoom: 1.0, meta: { w, h, crop } };
+
+  // Иначе считаем, насколько нужно приблизить, чтобы “вырезать” поля:
+  // масштаб = max( W/cropW, H/cropH )
+  let zoom = Math.max(w / crop.cw, h / crop.ch);
+
+  // Зажимаем в разумные пределы
+  zoom = Math.max(1.0, Math.min(2.3, zoom));
+
+  return { forceZoom: zoom, meta: { w, h, crop } };
+}
 
     // 2) Register temp assets and build local HTTP URLs
     token = registerAssets({ videoPath: localVideo, musicPath: localMusic });
