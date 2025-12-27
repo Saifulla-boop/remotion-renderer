@@ -7,11 +7,9 @@ type Props = {
   videoUrl: string;
   musicUrl: string;
   durationSec: number;
-  textPosition?: "top" | "center" | "auto";
 
-  // НОВОЕ: если хочешь принудительно “дожать” кроп (когда в исходнике уже есть черные поля)
-  // Можно не передавать — будет auto по длине.
-  forceZoom?: number; // например 1.0..2.2
+  textPosition?: "top" | "center" | "auto";
+  forceZoom?: number; // авто-зум из server.mjs
 };
 
 const normalize = (t: string) => (t || "").replace(/\s+/g, " ").trim();
@@ -35,6 +33,13 @@ const autoFontSize = (text: string) => {
   return 28;
 };
 
+const autoBoxPadding = (text: string) => {
+  const len = normalize(text).length;
+  if (len <= 40) return "18px 22px";
+  if (len <= 90) return "18px 22px";
+  return "16px 18px";
+};
+
 export const Short: React.FC<Props> = ({
   hook,
   videoUrl,
@@ -51,13 +56,12 @@ export const Short: React.FC<Props> = ({
   }, [textPosition, cleanHook]);
 
   const fontSize = useMemo(() => autoFontSize(cleanHook), [cleanHook]);
+  const boxPadding = useMemo(() => autoBoxPadding(cleanHook), [cleanHook]);
 
-  // ВАЖНО:
-  // 1) cover + center
-  // 2) плюс масштаб (zoom), чтобы убрать “запеченные” черные поля, если они есть
-  // Если не знаем — держим 1.0, но ты можешь поднимать forceZoom до ~1.6–2.0
+  // авто-зум от renderer; если не пришёл — 1.0
   const zoom = forceZoom ?? 1.0;
 
+  // плавное появление текста
   const opacity = interpolate(frame, [6, 18], [0, 1], {
     extrapolateLeft: "clamp",
     extrapolateRight: "clamp",
@@ -69,21 +73,17 @@ export const Short: React.FC<Props> = ({
 
   const topValue = pos === "top" ? "10%" : "38%";
 
+  // ПРИТЕМНЕНИЕ: мягко, чтобы глаз отдыхал и текст читался
+  // Можно регулировать: 0.12..0.28 обычно самое приятное
+  const dimOpacity = 0.18;
+
   return (
     <AbsoluteFill style={{ backgroundColor: "black" }}>
-      {/* ВИДЕО СЛОЙ: гарантированный центр-кроп */}
+      {/* ВИДЕО: гарантированный центр-кроп + зум */}
       <AbsoluteFill style={{ overflow: "hidden" }}>
-        {/* Центруем как “слой” и кропаем */}
-        <div
-          style={{
-            position: "absolute",
-            inset: 0,
-            overflow: "hidden",
-          }}
-        >
+        <div style={{ position: "absolute", inset: 0, overflow: "hidden" }}>
           <OffthreadVideo
             src={videoUrl}
-            // КЛЮЧ: позиционируем и масштабируем сами (это надежнее, чем надеяться на fit)
             style={{
               position: "absolute",
               left: "50%",
@@ -97,7 +97,18 @@ export const Short: React.FC<Props> = ({
           />
         </div>
 
-        {/* лёгкий градиент сверху для читаемости текста */}
+        {/* 1) Общий мягкий dim overlay */}
+        <div
+          style={{
+            position: "absolute",
+            inset: 0,
+            background: "black",
+            opacity: dimOpacity,
+            pointerEvents: "none",
+          }}
+        />
+
+        {/* 2) Доп. градиент сверху — помогает в режиме top */}
         <div
           style={{
             position: "absolute",
@@ -112,7 +123,7 @@ export const Short: React.FC<Props> = ({
         />
       </AbsoluteFill>
 
-      {/* ТЕКСТ: только top/center, по центру X */}
+      {/* ТЕКСТ */}
       <div
         style={{
           position: "absolute",
@@ -132,7 +143,7 @@ export const Short: React.FC<Props> = ({
             width: "100%",
             background: "rgba(255,255,255,0.96)",
             borderRadius: 18,
-            padding: "18px 22px",
+            padding: boxPadding,
             boxShadow: "0 18px 40px rgba(0,0,0,0.22)",
             border: "1px solid rgba(0,0,0,0.06)",
           }}
