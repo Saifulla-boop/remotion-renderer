@@ -1,37 +1,30 @@
 import React from "react";
-import { AbsoluteFill, Audio, useCurrentFrame, interpolate } from "remotion";
+import { AbsoluteFill, Audio } from "remotion";
 import { OffthreadVideo } from "remotion";
+import { PremiumBusinessText } from "./PremiumBusinessText";
 
-export const Short: React.FC<any> = ({
-  hook,
-  videoUrl,
-  musicUrl,
-}) => {
-  const frame = useCurrentFrame();
-  const opacity = interpolate(frame, [0, 15], [0, 1]);
-
+export const Short: React.FC<{
+  hook: string;
+  videoUrl: string;
+  musicUrl: string;
+  durationSec: number;
+  style?: string;
+  emphasis?: string[];
+}> = ({ hook, videoUrl, musicUrl, style, emphasis }) => {
   return (
-    <AbsoluteFill>
-      <OffthreadVideo src={videoUrl} />
+    <AbsoluteFill style={{ backgroundColor: "black" }}>
+      <AbsoluteFill>
+        <OffthreadVideo src={videoUrl} />
+      </AbsoluteFill>
 
-      <div
-        style={{
-          position: "absolute",
-          top: 60,
-          left: 60,
-          right: 60,
-          color: "white",
-          fontSize: 72,
-          fontWeight: 800,
-          lineHeight: 1.1,
-          opacity,
-          textShadow: "0 8px 24px rgba(0,0,0,0.6)",
-        }}
-      >
-        {hook}
-      </div>
+      {/* Премиум-стиль (пока один) */}
+      {style === "premium_business" || !style ? (
+        <PremiumBusinessText hook={hook} emphasis={emphasis} />
+      ) : (
+        <PremiumBusinessText hook={hook} emphasis={emphasis} />
+      )}
 
-      {musicUrl && <Audio src={musicUrl} volume={0.12} />}
+      {musicUrl ? <Audio src={musicUrl} volume={0.1} /> : null}
     </AbsoluteFill>
   );
 };
