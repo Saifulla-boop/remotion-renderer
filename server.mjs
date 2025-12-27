@@ -1,4 +1,3 @@
-// server.mjs
 import express from "express";
 import os from "os";
 import path from "path";
@@ -53,10 +52,7 @@ async function downloadFromDrive(fileId, outPath) {
 }
 
 // -------------------- Local assets served via HTTP (for OffthreadVideo) --------------------
-/**
- * token -> { videoPath: string, musicPath?: string, expiresAt: number }
- */
-const ASSETS = new Map();
+const ASSETS = new Map(); // token -> { videoPath, musicPath?, expiresAt }
 
 function createToken() {
   return crypto.randomBytes(16).toString("hex");
@@ -97,8 +93,8 @@ app.get("/asset/:token/music", (req, res) => {
   fs.createReadStream(entry.musicPath).pipe(res);
 });
 
-// -------------------- ffmpeg helpers (auto-zoom) --------------------
-function run(cmd, args, { timeoutMs = 30000 } = {}) {
+// -------------------- ffprobe helpers (orientation) --------------------
+function run(cmd, args, { timeoutMs = 25000 } = {}) {
   return new Promise((resolve, reject) => {
     const p = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"] });
 
@@ -139,83 +135,6 @@ async function getVideoDims(filePath) {
   return { w, h };
 }
 
-function parseLastCrop(ffmpegStderr) {
-  const matches = [...ffmpegStderr.matchAll(/crop=(\d+):(\d+):(\d+):(\d+)/g)];
-  if (!matches.length) return null;
-  const m = matches[matches.length - 1];
-  return {
-    cw: Number(m[1]),
-    ch: Number(m[2]),
-    cx: Number(m[3]),
-    cy: Number(m[4]),
-  };
-}
-
-function median(nums) {
-  const a = nums.slice().sort((x, y) => x - y);
-  const mid = Math.floor(a.length / 2);
-  return a.length % 2 ? a[mid] : (a[mid - 1] + a[mid]) / 2;
-}
-
-/**
- * detectAutoZoom:
- * - if video has "baked-in" black bars, cropdetect finds smaller useful area
- * - zoom = max(W/cropW, H/cropH)
- * - we sample multiple timestamps to avoid false detections
- */
-async function detectAutoZoom(filePath) {
-  const { w, h } = await getVideoDims(filePath);
-
-  const sampleTimes = ["0.2", "1.0", "1.8"]; // seconds
-  const zooms = [];
-
-  for (const ss of sampleTimes) {
-    try {
-      const { err } = await run("ffmpeg", [
-        "-hide_banner",
-        "-loglevel",
-        "info",
-        "-ss",
-        ss,
-        "-t",
-        "0.6",
-        "-i",
-        filePath,
-        "-vf",
-        "cropdetect=24:16:0",
-        "-f",
-        "null",
-        "-",
-      ]);
-
-      const crop = parseLastCrop(err);
-      if (!crop?.cw || !crop?.ch) continue;
-
-      const sameW = crop.cw / w > 0.97;
-      const sameH = crop.ch / h > 0.97;
-
-      if (sameW && sameH) {
-        zooms.push(1.0);
-        continue;
-      }
-
-      let z = Math.max(w / crop.cw, h / crop.ch);
-      z = Math.max(1.0, Math.min(2.3, z));
-      zooms.push(z);
-    } catch {
-      // ignore this sample
-    }
-  }
-
-  if (!zooms.length) {
-    return { forceZoom: 1.0, meta: { w, h, zooms: [] } };
-  }
-
-  // берём медиану — стабильнее
-  const forceZoom = Math.max(1.0, Math.min(2.3, median(zooms)));
-  return { forceZoom, meta: { w, h, zooms } };
-}
-
 // -------------------- Remotion bundle cache --------------------
 let serveUrl = null;
 
@@ -230,19 +149,6 @@ async function getBundle() {
 // -------------------- Routes --------------------
 app.get("/health", (_, res) => res.json({ ok: true }));
 
-/**
- * POST /render
- * Body:
- * {
- *   "hook": "Почему нет продаж?",
- *   "videoFileId": "...",
- *   "musicFileId": "...",   // optional
- *   "durationSec": 12,
- *   "textPosition": "auto" | "top" | "center" // optional
- * }
- *
- * Response: mp4 binary
- */
 app.post("/render", async (req, res) => {
   let localVideo = null;
   let localMusic = null;
@@ -272,11 +178,16 @@ app.post("/render", async (req, res) => {
       await downloadFromDrive(musicFileId, localMusic);
     }
 
-    // 2) compute auto-zoom (fix baked black bars)
-    const { forceZoom, meta } = await detectAutoZoom(localVideo);
-    console.log("AUTOZOOM:", forceZoom, meta);
+    // 2) detect orientation
+    const { w, h } = await getVideoDims(localVideo);
+    const isHorizontal = w > h;
 
-    // 3) register local assets for OffthreadVideo via HTTP
+    // горизонтальные — CONTAIN (как фото 2)
+    // вертикальные — COVER (как обычный рилс)
+    const fitMode = isHorizontal ? "contain" : "cover";
+    console.log("VIDEO_DIMS:", { w, h, isHorizontal, fitMode });
+
+    // 3) serve local assets via HTTP
     token = registerAssets({ videoPath: localVideo, musicPath: localMusic });
     const baseUrl = `http://127.0.0.1:${PORT}`;
     const videoUrl = `${baseUrl}/asset/${token}/video`;
@@ -288,17 +199,15 @@ app.post("/render", async (req, res) => {
       musicUrl,
       durationSec: duration,
       textPosition: textPosition || "auto",
-      forceZoom,
+      fitMode, // <-- ВАЖНО
     };
 
-    // 4) select composition
     const composition = await selectComposition({
       serveUrl: serve,
       id: "Short",
       inputProps,
     });
 
-    // 5) render mp4
     outPath = path.join(os.tmpdir(), `out-${Date.now()}.mp4`);
 
     await renderMedia({
@@ -313,7 +222,6 @@ app.post("/render", async (req, res) => {
       inputProps,
     });
 
-    // 6) send binary mp4
     res.setHeader("Content-Type", "video/mp4");
     res.setHeader("Content-Disposition", `attachment; filename="short.mp4"`);
 
