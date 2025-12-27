@@ -1,5 +1,5 @@
 import React, { useMemo } from "react";
-import { AbsoluteFill, Audio, useCurrentFrame, interpolate } from "remotion";
+import { AbsoluteFill, Audio, interpolate, useCurrentFrame } from "remotion";
 import { OffthreadVideo } from "remotion";
 
 type Props = {
@@ -7,34 +7,25 @@ type Props = {
   videoUrl: string;
   musicUrl: string;
   durationSec: number;
-
-  // можно передать принудительно, но если не передал — будет auto
   textPosition?: "top" | "center" | "auto";
+
+  // НОВОЕ: если хочешь принудительно “дожать” кроп (когда в исходнике уже есть черные поля)
+  // Можно не передавать — будет auto по длине.
+  forceZoom?: number; // например 1.0..2.2
 };
 
-// нормализация текста
 const normalize = (t: string) => (t || "").replace(/\s+/g, " ").trim();
 
-// авто-позиция: короткое — в центр, длинное — наверх
 const autoTextPosition = (text: string): "top" | "center" => {
   const t = normalize(text);
   const len = t.length;
   const words = t.split(" ").filter(Boolean).length;
-
-  // 1 строка / коротко — центр
   if (len <= 38 && words <= 6) return "center";
-
-  // среднее — верх
-  if (len <= 85) return "top";
-
-  // очень длинное — верх (и мы уменьшим шрифт)
   return "top";
 };
 
-// авто-размер шрифта под длину (капсом текст визуально “раздувается”)
 const autoFontSize = (text: string) => {
   const len = normalize(text).length;
-
   if (len <= 26) return 60;
   if (len <= 38) return 54;
   if (len <= 52) return 46;
@@ -44,35 +35,29 @@ const autoFontSize = (text: string) => {
   return 28;
 };
 
-// авто-padding плашки под длину (чтобы длинные не выглядели “зажатыми”)
-const autoBoxPadding = (text: string) => {
-  const len = normalize(text).length;
-  if (len <= 40) return "18px 22px";
-  if (len <= 80) return "18px 22px";
-  return "16px 18px";
-};
-
 export const Short: React.FC<Props> = ({
   hook,
   videoUrl,
   musicUrl,
   textPosition = "auto",
+  forceZoom,
 }) => {
   const frame = useCurrentFrame();
-
   const cleanHook = useMemo(() => normalize(hook), [hook]);
 
-  // Позиция текста (auto -> top/center)
   const pos = useMemo(() => {
     if (textPosition === "top" || textPosition === "center") return textPosition;
     return autoTextPosition(cleanHook);
   }, [textPosition, cleanHook]);
 
-  // Стиль текста
   const fontSize = useMemo(() => autoFontSize(cleanHook), [cleanHook]);
-  const boxPadding = useMemo(() => autoBoxPadding(cleanHook), [cleanHook]);
 
-  // Анимация: премиум-спокойно
+  // ВАЖНО:
+  // 1) cover + center
+  // 2) плюс масштаб (zoom), чтобы убрать “запеченные” черные поля, если они есть
+  // Если не знаем — держим 1.0, но ты можешь поднимать forceZoom до ~1.6–2.0
+  const zoom = forceZoom ?? 1.0;
+
   const opacity = interpolate(frame, [6, 18], [0, 1], {
     extrapolateLeft: "clamp",
     extrapolateRight: "clamp",
@@ -86,19 +71,33 @@ export const Short: React.FC<Props> = ({
 
   return (
     <AbsoluteFill style={{ backgroundColor: "black" }}>
-      {/* 1) ВИДЕО: center-crop под 9:16 */}
+      {/* ВИДЕО СЛОЙ: гарантированный центр-кроп */}
       <AbsoluteFill style={{ overflow: "hidden" }}>
-        <OffthreadVideo
-          src={videoUrl}
+        {/* Центруем как “слой” и кропаем */}
+        <div
           style={{
-            width: "100%",
-            height: "100%",
-            objectFit: "cover",
-            objectPosition: "center",
+            position: "absolute",
+            inset: 0,
+            overflow: "hidden",
           }}
-        />
+        >
+          <OffthreadVideo
+            src={videoUrl}
+            // КЛЮЧ: позиционируем и масштабируем сами (это надежнее, чем надеяться на fit)
+            style={{
+              position: "absolute",
+              left: "50%",
+              top: "50%",
+              width: "100%",
+              height: "100%",
+              transform: `translate(-50%, -50%) scale(${zoom})`,
+              objectFit: "cover",
+              objectPosition: "center",
+            }}
+          />
+        </div>
 
-        {/* градиент сверху — чтобы текст всегда читался */}
+        {/* лёгкий градиент сверху для читаемости текста */}
         <div
           style={{
             position: "absolute",
@@ -113,7 +112,7 @@ export const Short: React.FC<Props> = ({
         />
       </AbsoluteFill>
 
-      {/* 2) ТЕКСТ: top/center (auto), строго по центру по X */}
+      {/* ТЕКСТ: только top/center, по центру X */}
       <div
         style={{
           position: "absolute",
@@ -133,7 +132,7 @@ export const Short: React.FC<Props> = ({
             width: "100%",
             background: "rgba(255,255,255,0.96)",
             borderRadius: 18,
-            padding: boxPadding,
+            padding: "18px 22px",
             boxShadow: "0 18px 40px rgba(0,0,0,0.22)",
             border: "1px solid rgba(0,0,0,0.06)",
           }}
@@ -158,7 +157,6 @@ export const Short: React.FC<Props> = ({
         </div>
       </div>
 
-      {/* 3) МУЗЫКА */}
       {musicUrl ? <Audio src={musicUrl} volume={0.1} /> : null}
     </AbsoluteFill>
   );
