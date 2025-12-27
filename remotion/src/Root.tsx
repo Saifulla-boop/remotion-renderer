@@ -11,10 +11,12 @@ export const RemotionRoot: React.FC = () => (
     fps={30}
     durationInFrames={30 * 12}
     defaultProps={{
-      hook: "Почему это важно?",
+      hook: "Почему бизнес не масштабируется",
       videoUrl: "",
       musicUrl: "",
       durationSec: 12,
+      style: "premium_business",
+      emphasis: ["не масштабируется"],
     }}
   />
 );
