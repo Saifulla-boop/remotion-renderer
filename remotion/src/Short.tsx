@@ -9,7 +9,7 @@ type Props = {
   durationSec: number;
 
   textPosition?: "top" | "center" | "auto";
-  forceZoom?: number; // авто-зум из server.mjs
+  forceZoom?: number; // приходит из server.mjs (auto-zoom)
 };
 
 const normalize = (t: string) => (t || "").replace(/\s+/g, " ").trim();
@@ -58,10 +58,10 @@ export const Short: React.FC<Props> = ({
   const fontSize = useMemo(() => autoFontSize(cleanHook), [cleanHook]);
   const boxPadding = useMemo(() => autoBoxPadding(cleanHook), [cleanHook]);
 
-  // авто-зум от renderer; если не пришёл — 1.0
+  // КЛЮЧ: zoom применяется ВСЕГДА, даже если cover уже “кропает”.
+  // Если в исходнике есть “запечённые” чёрные поля — auto-zoom выдавит их.
   const zoom = forceZoom ?? 1.0;
 
-  // плавное появление текста
   const opacity = interpolate(frame, [6, 18], [0, 1], {
     extrapolateLeft: "clamp",
     extrapolateRight: "clamp",
@@ -73,13 +73,12 @@ export const Short: React.FC<Props> = ({
 
   const topValue = pos === "top" ? "10%" : "38%";
 
-  // ПРИТЕМНЕНИЕ: мягко, чтобы глаз отдыхал и текст читался
-  // Можно регулировать: 0.12..0.28 обычно самое приятное
+  // Притемнение (у тебя уже зашло)
   const dimOpacity = 0.18;
 
   return (
     <AbsoluteFill style={{ backgroundColor: "black" }}>
-      {/* ВИДЕО: гарантированный центр-кроп + зум */}
+      {/* ВИДЕО: гарантированный center-crop + zoom */}
       <AbsoluteFill style={{ overflow: "hidden" }}>
         <div style={{ position: "absolute", inset: 0, overflow: "hidden" }}>
           <OffthreadVideo
@@ -97,7 +96,7 @@ export const Short: React.FC<Props> = ({
           />
         </div>
 
-        {/* 1) Общий мягкий dim overlay */}
+        {/* общий dim overlay */}
         <div
           style={{
             position: "absolute",
@@ -108,7 +107,7 @@ export const Short: React.FC<Props> = ({
           }}
         />
 
-        {/* 2) Доп. градиент сверху — помогает в режиме top */}
+        {/* градиент сверху — читаемость текста */}
         <div
           style={{
             position: "absolute",
@@ -123,7 +122,7 @@ export const Short: React.FC<Props> = ({
         />
       </AbsoluteFill>
 
-      {/* ТЕКСТ */}
+      {/* ТЕКСТ: top/center (auto), по центру X */}
       <div
         style={{
           position: "absolute",
