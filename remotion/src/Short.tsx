@@ -9,7 +9,7 @@ type Props = {
   durationSec: number;
 
   textPosition?: "top" | "center" | "auto";
-  forceZoom?: number; // приходит из server.mjs (auto-zoom)
+  fitMode?: "contain" | "cover"; // <-- приходит из server.mjs
 };
 
 const normalize = (t: string) => (t || "").replace(/\s+/g, " ").trim();
@@ -45,7 +45,7 @@ export const Short: React.FC<Props> = ({
   videoUrl,
   musicUrl,
   textPosition = "auto",
-  forceZoom,
+  fitMode = "cover",
 }) => {
   const frame = useCurrentFrame();
   const cleanHook = useMemo(() => normalize(hook), [hook]);
@@ -58,10 +58,6 @@ export const Short: React.FC<Props> = ({
   const fontSize = useMemo(() => autoFontSize(cleanHook), [cleanHook]);
   const boxPadding = useMemo(() => autoBoxPadding(cleanHook), [cleanHook]);
 
-  // КЛЮЧ: zoom применяется ВСЕГДА, даже если cover уже “кропает”.
-  // Если в исходнике есть “запечённые” чёрные поля — auto-zoom выдавит их.
-  const zoom = forceZoom ?? 1.0;
-
   const opacity = interpolate(frame, [6, 18], [0, 1], {
     extrapolateLeft: "clamp",
     extrapolateRight: "clamp",
@@ -73,30 +69,24 @@ export const Short: React.FC<Props> = ({
 
   const topValue = pos === "top" ? "10%" : "38%";
 
-  // Притемнение (у тебя уже зашло)
+  // затемнение (работает у тебя хорошо — оставляем)
   const dimOpacity = 0.18;
 
   return (
     <AbsoluteFill style={{ backgroundColor: "black" }}>
-      {/* ВИДЕО: гарантированный center-crop + zoom */}
+      {/* ВИДЕО */}
       <AbsoluteFill style={{ overflow: "hidden" }}>
-        <div style={{ position: "absolute", inset: 0, overflow: "hidden" }}>
-          <OffthreadVideo
-            src={videoUrl}
-            style={{
-              position: "absolute",
-              left: "50%",
-              top: "50%",
-              width: "100%",
-              height: "100%",
-              transform: `translate(-50%, -50%) scale(${zoom})`,
-              objectFit: "cover",
-              objectPosition: "center",
-            }}
-          />
-        </div>
+        <OffthreadVideo
+          src={videoUrl}
+          style={{
+            width: "100%",
+            height: "100%",
+            objectFit: fitMode, // <-- contain для горизонтальных, cover для вертикальных
+            objectPosition: "center",
+          }}
+        />
 
-        {/* общий dim overlay */}
+        {/* мягкое общее затемнение */}
         <div
           style={{
             position: "absolute",
@@ -107,7 +97,7 @@ export const Short: React.FC<Props> = ({
           }}
         />
 
-        {/* градиент сверху — читаемость текста */}
+        {/* градиент сверху (для читаемости текста, особенно в режиме top) */}
         <div
           style={{
             position: "absolute",
@@ -122,7 +112,7 @@ export const Short: React.FC<Props> = ({
         />
       </AbsoluteFill>
 
-      {/* ТЕКСТ: top/center (auto), по центру X */}
+      {/* ТЕКСТ: только top/center */}
       <div
         style={{
           position: "absolute",
