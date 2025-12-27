@@ -1,5 +1,5 @@
 import React, { useMemo } from "react";
-import { AbsoluteFill, Audio, interpolate, useCurrentFrame } from "remotion";
+import { AbsoluteFill, Audio } from "remotion";
 import { OffthreadVideo } from "remotion";
 
 type Props = {
@@ -8,68 +8,31 @@ type Props = {
   musicUrl: string;
   durationSec: number;
 
-  textPosition?: "top" | "center" | "auto";
-  fitMode?: "contain" | "cover"; // <-- приходит из server.mjs
+  fitMode?: "contain" | "cover"; // приходит из server.mjs
 };
 
 const normalize = (t: string) => (t || "").replace(/\s+/g, " ").trim();
 
-const autoTextPosition = (text: string): "top" | "center" => {
-  const t = normalize(text);
-  const len = t.length;
-  const words = t.split(" ").filter(Boolean).length;
-  if (len <= 38 && words <= 6) return "center";
-  return "top";
-};
-
-const autoFontSize = (text: string) => {
+const autoFontSizeTop = (text: string) => {
   const len = normalize(text).length;
-  if (len <= 26) return 60;
-  if (len <= 38) return 54;
-  if (len <= 52) return 46;
-  if (len <= 70) return 40;
-  if (len <= 90) return 36;
-  if (len <= 115) return 32;
-  return 28;
-};
-
-const autoBoxPadding = (text: string) => {
-  const len = normalize(text).length;
-  if (len <= 40) return "18px 22px";
-  if (len <= 90) return "18px 22px";
-  return "16px 18px";
+  // Шапка: чем длиннее текст, тем меньше шрифт (как в рефе)
+  if (len <= 32) return 54;
+  if (len <= 55) return 46;
+  if (len <= 80) return 40;
+  if (len <= 110) return 36;
+  return 32;
 };
 
 export const Short: React.FC<Props> = ({
   hook,
   videoUrl,
   musicUrl,
-  textPosition = "auto",
   fitMode = "cover",
 }) => {
-  const frame = useCurrentFrame();
-  const cleanHook = useMemo(() => normalize(hook), [hook]);
+  const cleanHook = useMemo(() => normalize(hook).toUpperCase(), [hook]);
+  const fontSize = useMemo(() => autoFontSizeTop(cleanHook), [cleanHook]);
 
-  const pos = useMemo(() => {
-    if (textPosition === "top" || textPosition === "center") return textPosition;
-    return autoTextPosition(cleanHook);
-  }, [textPosition, cleanHook]);
-
-  const fontSize = useMemo(() => autoFontSize(cleanHook), [cleanHook]);
-  const boxPadding = useMemo(() => autoBoxPadding(cleanHook), [cleanHook]);
-
-  const opacity = interpolate(frame, [6, 18], [0, 1], {
-    extrapolateLeft: "clamp",
-    extrapolateRight: "clamp",
-  });
-  const y = interpolate(frame, [6, 18], [10, 0], {
-    extrapolateLeft: "clamp",
-    extrapolateRight: "clamp",
-  });
-
-  const topValue = pos === "top" ? "10%" : "38%";
-
-  // затемнение (работает у тебя хорошо — оставляем)
+  // Общее притемнение оставляем (у тебя зашло)
   const dimOpacity = 0.18;
 
   return (
@@ -81,7 +44,7 @@ export const Short: React.FC<Props> = ({
           style={{
             width: "100%",
             height: "100%",
-            objectFit: fitMode, // <-- contain для горизонтальных, cover для вертикальных
+            objectFit: fitMode, // contain для горизонтальных, cover для вертикальных
             objectPosition: "center",
           }}
         />
@@ -97,63 +60,49 @@ export const Short: React.FC<Props> = ({
           }}
         />
 
-        {/* градиент сверху (для читаемости текста, особенно в режиме top) */}
+        {/* ЧЁРНАЯ "ШАПКА" как в рефе (градиент вниз) */}
         <div
           style={{
             position: "absolute",
             top: 0,
             left: 0,
             right: 0,
-            height: "48%",
+            height: "34%", // можно 30–38% под вкус
             background:
-              "linear-gradient(to bottom, rgba(0,0,0,0.55), rgba(0,0,0,0))",
+              "linear-gradient(to bottom, rgba(0,0,0,0.92), rgba(0,0,0,0.40), rgba(0,0,0,0))",
             pointerEvents: "none",
           }}
         />
       </AbsoluteFill>
 
-      {/* ТЕКСТ: только top/center */}
+      {/* ТЕКСТ СВЕРХУ (без плашки, без анимации) */}
       <div
         style={{
           position: "absolute",
-          top: topValue,
+          top: 90, // отступ как в рефе; можно 70–120
           left: "50%",
-          transform: `translate(-50%, ${y}px)`,
-          opacity,
+          transform: "translateX(-50%)",
           width: "92%",
           maxWidth: 980,
-          display: "flex",
-          justifyContent: "center",
+          textAlign: "center",
           padding: "0 24px",
         }}
       >
         <div
           style={{
-            width: "100%",
-            background: "rgba(255,255,255,0.96)",
-            borderRadius: 18,
-            padding: boxPadding,
-            boxShadow: "0 18px 40px rgba(0,0,0,0.22)",
-            border: "1px solid rgba(0,0,0,0.06)",
+            fontFamily:
+              'Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Arial',
+            fontWeight: 900,
+            fontSize,
+            lineHeight: 1.12,
+            letterSpacing: "-0.01em",
+            color: "#FFFFFF",
+            textShadow: "0 8px 22px rgba(0,0,0,0.55)",
+            wordBreak: "break-word",
+            overflowWrap: "anywhere",
           }}
         >
-          <div
-            style={{
-              fontFamily:
-                'Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Arial',
-              fontWeight: 900,
-              fontSize,
-              lineHeight: 1.08,
-              letterSpacing: "-0.01em",
-              color: "#0B0B0B",
-              textAlign: "center",
-              textTransform: "uppercase",
-              wordBreak: "break-word",
-              overflowWrap: "anywhere",
-            }}
-          >
-            {cleanHook.toUpperCase()}
-          </div>
+          {cleanHook}
         </div>
       </div>
 
