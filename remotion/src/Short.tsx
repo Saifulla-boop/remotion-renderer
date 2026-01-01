@@ -1,108 +1,89 @@
 import React, {useMemo} from "react";
-import {AbsoluteFill, Audio, Video, useVideoConfig} from "remotion";
+import {
+  AbsoluteFill,
+  Audio,
+  Img,
+  staticFile,
+  useVideoConfig,
+  Video,
+} from "remotion";
 
-type Props = {
-  hook: string;
-  videoPath: string;
-  musicPath: string;
+type ShortProps = {
+  videoSrc: string;      // ссылка на видео (у тебя формируется из videoFileId)
+  musicSrc: string;      // ссылка на музыку (у тебя формируется из musicFileId)
+  hook: string;          // заголовок/хук
+  // description можно не рендерить на видео, оно уходит в подпись в телеге
 };
 
-const ORANGE = "rgba(164, 86, 22, 0.78)"; // полупрозрачная оранжевая плашка (как на рефе)
-const DIM = "rgba(0,0,0,0.20)";           // лёгкое затемнение всего видео
+const clampLines = (text: string) => (text || "").trim();
 
-// ВАЖНО: именно здесь правишь положение/размер как просил
-const CARD_Y = 0.63;     // 0..1 — вертикальная позиция плашки (0.63 ≈ ниже середины, как на фото 1)
-const CARD_MAX_W = 0.86; // ширина плашки относительно кадра
-const CARD_PAD_Y = 28;
-const CARD_PAD_X = 34;
-const CARD_RADIUS = 18;
-
-function normalizeHook(text: string) {
-  // Чистим лишние пробелы + мягко ограничиваем переносы
-  return String(text || "")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-export const Short: React.FC<Props> = ({hook, videoPath, musicPath}) => {
+export const Short: React.FC<ShortProps> = ({videoSrc, musicSrc, hook}) => {
   const {width, height} = useVideoConfig();
 
-  const clean = useMemo(() => normalizeHook(hook), [hook]);
+  // Позиция блока (ниже, как на референсе)
+  const boxBottom = Math.round(height * 0.34); // чем больше — тем ВЫШЕ, чем меньше — тем НИЖЕ
+  const boxMaxWidth = Math.round(width * 0.86);
 
-  /**
-   * СТИЛЬ КАК В РЕФЕ:
-   * - тонкий шрифт
-   * - белый цвет
-   * - немного трекинга
-   */
-  const fontFamily =
-    'Inter, "SF Pro Display", -apple-system, system-ui, Segoe UI, Roboto, Arial, sans-serif';
+  const safeHook = useMemo(() => clampLines(hook), [hook]);
 
   return (
     <AbsoluteFill style={{backgroundColor: "black"}}>
-      {/* Видео: без растяжения — contain по центру + чёрные поля если горизонталь */}
-      <AbsoluteFill
-        style={{
-          justifyContent: "center",
-          alignItems: "center",
-        }}
-      >
-        console.log("PROPS", { hook, videoPath, musicPath });
+      {/* Видео */}
+      <AbsoluteFill>
         <Video
-          src={videoPath}
+          src={videoSrc}
           style={{
             width: "100%",
             height: "100%",
-            objectFit: "contain",
+            objectFit: "cover",
           }}
-          muted
         />
       </AbsoluteFill>
 
-      {/* Лёгкое затемнение всего видео */}
-      <AbsoluteFill style={{backgroundColor: DIM}} />
-
-      {/* Плашка + текст */}
+      {/* Притемнение (как на референсе) */}
       <AbsoluteFill
         style={{
-          justifyContent: "flex-start",
+          backgroundColor: "rgba(0,0,0,0.25)", // усиливай/ослабляй тут
+        }}
+      />
+
+      {/* Блок с хуком */}
+      <AbsoluteFill
+        style={{
+          justifyContent: "flex-end",
           alignItems: "center",
+          paddingBottom: boxBottom,
         }}
       >
         <div
           style={{
-            position: "absolute",
-            top: `${CARD_Y * height}px`,
-            left: "50%",
-            transform: "translateX(-50%)",
-            width: `${CARD_MAX_W * width}px`,
-            backgroundColor: ORANGE,
-            borderRadius: CARD_RADIUS,
-            padding: `${CARD_PAD_Y}px ${CARD_PAD_X}px`,
-            boxSizing: "border-box",
+            width: boxMaxWidth,
+            backgroundColor: "rgba(175, 92, 30, 0.68)", // оранжевая подложка
+            borderRadius: 26,
+            padding: "22px 28px",
+            boxShadow: "0 14px 40px rgba(0,0,0,0.30)",
           }}
         >
           <div
             style={{
-              fontFamily,
-              fontWeight: 300,
-              fontSize: 54,          // если надо тоньше/меньше — снижай
-              lineHeight: 1.15,
-              letterSpacing: 0.5,
-              color: "rgba(255,255,255,0.95)",
+              color: "rgba(255,255,255,0.92)",
+              fontFamily:
+                '-apple-system, BlinkMacSystemFont, "SF Pro Display", "Inter", "Segoe UI", Roboto, Arial, sans-serif',
+              fontWeight: 400,            // тонко, как в рефе
+              fontSize: 54,               // под 1080x1920
+              lineHeight: 1.12,
+              letterSpacing: -0.4,
               textAlign: "center",
-              textShadow: "0 1px 2px rgba(0,0,0,0.25)",
-              wordBreak: "break-word",
               whiteSpace: "pre-wrap",
             }}
           >
-            {clean}
+            {safeHook}
           </div>
         </div>
       </AbsoluteFill>
 
       {/* Музыка */}
-      <Audio src={musicPath} />
+      {!!musicSrc && <Audio src={musicSrc} volume={0.9} />}
     </AbsoluteFill>
   );
 };
