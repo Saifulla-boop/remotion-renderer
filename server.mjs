@@ -1,253 +1,240 @@
 import express from "express";
-import os from "os";
-import path from "path";
+import cors from "cors";
 import fs from "fs";
-import fsp from "fs/promises";
-import crypto from "crypto";
-import { spawn } from "child_process";
+import path from "path";
+import os from "os";
+import fetch from "node-fetch";
+import { fileURLToPath } from "url";
 
-import { bundle } from "@remotion/bundler";
-import { renderMedia, selectComposition } from "@remotion/renderer";
-import { google } from "googleapis";
+import {
+  bundle,
+  getCompositions,
+  renderMedia,
+} from "@remotion/renderer";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 const app = express();
-app.use(express.json({ limit: "5mb" }));
+app.use(cors());
+app.use(express.json({ limit: "2mb" }));
 
-const PORT = process.env.PORT || 3000;
+/**
+ * ============ CONFIG ============
+ * 1) Путь к Remotion проекту
+ *    Если у тебя проект в другой папке — поменяй тут.
+ */
+const REMOTION_ROOT = path.join(__dirname, "remotion"); // <-- поменяй если надо
+const REMOTION_ENTRY = path.join(REMOTION_ROOT, "src", "index.ts"); // <-- entry
 
-// -------------------- Google Drive (Service Account, READONLY) --------------------
-function getDrive() {
-  const email = process.env.GOOGLE_CLIENT_EMAIL;
-  const keyRaw = process.env.GOOGLE_PRIVATE_KEY;
+/**
+ * 2) Название композиции (compositionId) в Remotion
+ */
+const COMPOSITION_ID = process.env.COMPOSITION_ID || "Short"; // <-- должно совпадать с Composition id
 
-  if (!email || !keyRaw) {
-    throw new Error("Missing GOOGLE_CLIENT_EMAIL / GOOGLE_PRIVATE_KEY env vars.");
+/**
+ * 3) Google Drive
+ * Самый простой способ скачивания — публичная ссылка по fileId:
+ * https://drive.google.com/uc?export=download&id=FILE_ID
+ *
+ * Если у тебя Drive НЕ публичный — скажи, я дам версию через service account.
+ */
+const driveDownloadUrl = (fileId) =>
+  `https://drive.google.com/uc?export=download&id=${encodeURIComponent(fileId)}`;
+
+/**
+ * Чистим случайные символы типа "=" в fileId
+ * (у тебя такое уже всплывало)
+ */
+const cleanId = (s) => String(s || "").replace(/^=+/, "").trim();
+
+/**
+ * Скачиваем файл во временную папку
+ */
+async function downloadToTmp({ fileId, ext }) {
+  const safeId = cleanId(fileId);
+  if (!safeId) throw new Error("downloadToTmp: fileId is empty");
+
+  const url = driveDownloadUrl(safeId);
+
+  const res = await fetch(url, { redirect: "follow" });
+  if (!res.ok) {
+    throw new Error(`Drive download failed (${res.status}): ${url}`);
   }
 
-  const key = keyRaw.replace(/\\n/g, "\n");
-
-  const auth = new google.auth.JWT({
-    email,
-    key,
-    scopes: ["https://www.googleapis.com/auth/drive.readonly"],
-  });
-
-  return google.drive({ version: "v3", auth });
-}
-
-async function downloadFromDrive(fileId, outPath) {
-  const drive = getDrive();
-
-  const res = await drive.files.get(
-    { fileId, alt: "media" },
-    { responseType: "stream" }
-  );
+  const tmpPath = path.join(os.tmpdir(), `${Date.now()}-${safeId}.${ext}`);
+  const fileStream = fs.createWriteStream(tmpPath);
 
   await new Promise((resolve, reject) => {
-    const dest = fs.createWriteStream(outPath);
-    res.data.on("end", resolve).on("error", reject).pipe(dest);
+    res.body.pipe(fileStream);
+    res.body.on("error", reject);
+    fileStream.on("finish", resolve);
   });
 
-  return outPath;
-}
-
-// -------------------- Local assets served via HTTP (for OffthreadVideo) --------------------
-const ASSETS = new Map(); // token -> { videoPath, musicPath?, expiresAt }
-
-function createToken() {
-  return crypto.randomBytes(16).toString("hex");
-}
-
-function registerAssets({ videoPath, musicPath }) {
-  const token = createToken();
-  ASSETS.set(token, {
-    videoPath,
-    musicPath,
-    expiresAt: Date.now() + 15 * 60 * 1000,
-  });
-  return token;
-}
-
-function cleanupToken(token) {
-  ASSETS.delete(token);
-}
-
-setInterval(() => {
-  const now = Date.now();
-  for (const [token, v] of ASSETS.entries()) {
-    if (v.expiresAt < now) ASSETS.delete(token);
+  // минимальная проверка размера
+  const stat = fs.statSync(tmpPath);
+  if (!stat.size || stat.size < 1024) {
+    throw new Error(
+      `Downloaded file looks wrong (size=${stat.size}). Probably Drive returned an HTML page (not a file). fileId=${safeId}`
+    );
   }
-}, 2 * 60 * 1000);
 
-app.get("/asset/:token/video", (req, res) => {
-  const entry = ASSETS.get(req.params.token);
-  if (!entry?.videoPath) return res.status(404).send("Not found");
-  res.setHeader("Content-Type", "video/mp4");
-  fs.createReadStream(entry.videoPath).pipe(res);
+  return tmpPath;
+}
+
+let bundleLocation = null;
+let compositionsCache = null;
+
+/**
+ * Бандлим Remotion один раз при старте
+ */
+async function prepareRemotion() {
+  console.log("[remotion] bundling...");
+  bundleLocation = await bundle({
+    entryPoint: REMOTION_ENTRY,
+    webpackOverride: (config) => config,
+  });
+  console.log("[remotion] bundle ready:", bundleLocation);
+
+  compositionsCache = await getCompositions(bundleLocation, {
+    // inputProps можно оставить пустыми для получения списка
+    inputProps: {},
+  });
+  console.log(
+    "[remotion] compositions:",
+    compositionsCache.map((c) => c.id)
+  );
+}
+
+app.get("/health", (req, res) => {
+  res.json({ ok: true });
 });
 
-app.get("/asset/:token/music", (req, res) => {
-  const entry = ASSETS.get(req.params.token);
-  if (!entry?.musicPath) return res.status(404).send("Not found");
-  res.setHeader("Content-Type", "audio/mpeg");
-  fs.createReadStream(entry.musicPath).pipe(res);
-});
-
-// -------------------- ffprobe helpers (orientation) --------------------
-function run(cmd, args, { timeoutMs = 25000 } = {}) {
-  return new Promise((resolve, reject) => {
-    const p = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"] });
-
-    let out = "";
-    let err = "";
-
-    const t = setTimeout(() => {
-      p.kill("SIGKILL");
-      reject(new Error(`${cmd} timeout`));
-    }, timeoutMs);
-
-    p.stdout.on("data", (d) => (out += d.toString()));
-    p.stderr.on("data", (d) => (err += d.toString()));
-
-    p.on("close", (code) => {
-      clearTimeout(t);
-      if (code === 0) return resolve({ out, err });
-      reject(new Error(`${cmd} failed (${code})\n${err || out}`));
-    });
-  });
-}
-
-async function getVideoDims(filePath) {
-  const { out } = await run("ffprobe", [
-    "-v",
-    "error",
-    "-select_streams",
-    "v:0",
-    "-show_entries",
-    "stream=width,height",
-    "-of",
-    "csv=s=x:p=0",
-    filePath,
-  ]);
-
-  const [w, h] = out.trim().split("x").map(Number);
-  if (!w || !h) throw new Error("ffprobe could not read video dimensions");
-  return { w, h };
-}
-
-// -------------------- Remotion bundle cache --------------------
-let serveUrl = null;
-
-async function getBundle() {
-  if (serveUrl) return serveUrl;
-  serveUrl = await bundle({
-    entryPoint: path.join(process.cwd(), "remotion", "src", "index.ts"),
-  });
-  return serveUrl;
-}
-
-// -------------------- Routes --------------------
-app.get("/health", (_, res) => res.json({ ok: true }));
-
+/**
+ * Рендер
+ */
 app.post("/render", async (req, res) => {
-  let localVideo = null;
-  let localMusic = null;
-  let outPath = null;
-  let token = null;
-
   try {
-    const { hook, videoFileId, musicFileId, durationSec, textPosition } =
-      req.body || {};
+    const {
+      hook,
+      description,
+      videoFileId,
+      musicFileId,
+      durationSec,
+    } = req.body || {};
 
-    if (!videoFileId) {
-      return res.status(400).json({ error: "videoFileId required" });
+    // ---- Жёсткая валидация (чтобы не было "src undefined")
+    if (!hook || typeof hook !== "string") {
+      throw new Error("hook is missing (string required)");
+    }
+    if (typeof description !== "string") {
+      throw new Error("description is missing (string required)");
+    }
+    if (!videoFileId || typeof videoFileId !== "string") {
+      throw new Error("videoFileId is missing (string required)");
+    }
+    if (!musicFileId || typeof musicFileId !== "string") {
+      throw new Error("musicFileId is missing (string required)");
     }
 
-    const duration = Number.isFinite(Number(durationSec))
-      ? Math.min(Math.max(Number(durationSec), 6), 30)
-      : 12;
-
-    const serve = await getBundle();
-
-    // 1) download sources to /tmp
-    localVideo = path.join(os.tmpdir(), `in-video-${Date.now()}.mp4`);
-    await downloadFromDrive(videoFileId, localVideo);
-
-    if (musicFileId) {
-      localMusic = path.join(os.tmpdir(), `in-music-${Date.now()}.mp3`);
-      await downloadFromDrive(musicFileId, localMusic);
+    const dur = Number(durationSec ?? 12);
+    if (!Number.isFinite(dur) || dur <= 0) {
+      throw new Error("durationSec must be a positive number");
     }
 
-    // 2) detect orientation
-    const { w, h } = await getVideoDims(localVideo);
-    const isHorizontal = w > h;
+    console.log("[render] input:", {
+      hook,
+      descriptionLen: description.length,
+      videoFileId: cleanId(videoFileId),
+      musicFileId: cleanId(musicFileId),
+      durationSec: dur,
+    });
 
-    // горизонтальные — CONTAIN (как фото 2)
-    // вертикальные — COVER (как обычный рилс)
-    const fitMode = isHorizontal ? "contain" : "cover";
-    console.log("VIDEO_DIMS:", { w, h, isHorizontal, fitMode });
+    // ---- Скачиваем исходники
+    const videoPath = await downloadToTmp({ fileId: videoFileId, ext: "mp4" });
+    const musicPath = await downloadToTmp({ fileId: musicFileId, ext: "mp3" });
 
-    // 3) serve local assets via HTTP
-    token = registerAssets({ videoPath: localVideo, musicPath: localMusic });
-    const baseUrl = `http://127.0.0.1:${PORT}`;
-    const videoUrl = `${baseUrl}/asset/${token}/video`;
-    const musicUrl = localMusic ? `${baseUrl}/asset/${token}/music` : "";
+    if (!videoPath || typeof videoPath !== "string") {
+      throw new Error("videoPath is missing after download");
+    }
+    if (!musicPath || typeof musicPath !== "string") {
+      throw new Error("musicPath is missing after download");
+    }
 
+    // ---- Ищем композицию
+    const comps = compositionsCache || (await getCompositions(bundleLocation, { inputProps: {} }));
+    const comp = comps.find((c) => c.id === COMPOSITION_ID);
+
+    if (!comp) {
+      throw new Error(
+        `Composition "${COMPOSITION_ID}" not found. Available: ${comps
+          .map((c) => c.id)
+          .join(", ")}`
+      );
+    }
+
+    const outPath = path.join(os.tmpdir(), `render-${Date.now()}.mp4`);
+
+    // ---- inputProps, которые должны использоваться в short.tsx
     const inputProps = {
-      hook: String(hook ?? ""),
-      videoUrl,
-      musicUrl,
-      durationSec: duration,
-      textPosition: textPosition || "auto",
-      fitMode, // <-- ВАЖНО
+      hook,
+      description,
+      durationSec: dur,
+      videoPath,
+      musicPath,
     };
 
-    const composition = await selectComposition({
-      serveUrl: serve,
-      id: "Short",
-      inputProps,
+    console.log("[render] inputProps:", {
+      hook: inputProps.hook,
+      descriptionLen: inputProps.description.length,
+      durationSec: inputProps.durationSec,
+      videoPath: inputProps.videoPath,
+      musicPath: inputProps.musicPath,
     });
 
-    outPath = path.join(os.tmpdir(), `out-${Date.now()}.mp4`);
-
     await renderMedia({
-      composition: {
-        ...composition,
-        fps: 30,
-        durationInFrames: Math.round(duration * 30),
-      },
-      serveUrl: serve,
+      composition: comp,
+      serveUrl: bundleLocation,
       codec: "h264",
       outputLocation: outPath,
       inputProps,
+      // если нужно качество/скорость — можно добавить:
+      // crf: 18,
+      // preset: "medium",
     });
 
+    // ---- Отдаём файл бинарём
     res.setHeader("Content-Type", "video/mp4");
     res.setHeader("Content-Disposition", `attachment; filename="short.mp4"`);
 
     const stream = fs.createReadStream(outPath);
     stream.pipe(res);
 
-    stream.on("close", async () => {
-      try {
-        if (token) cleanupToken(token);
-        if (outPath) await fsp.unlink(outPath).catch(() => {});
-        if (localVideo) await fsp.unlink(localVideo).catch(() => {});
-        if (localMusic) await fsp.unlink(localMusic).catch(() => {});
-      } catch {}
+    stream.on("close", () => {
+      // чистим мусор
+      try { fs.unlinkSync(outPath); } catch {}
+      try { fs.unlinkSync(videoPath); } catch {}
+      try { fs.unlinkSync(musicPath); } catch {}
     });
   } catch (e) {
-    console.error(e);
-    if (!res.headersSent) {
-      res.status(500).json({ error: e?.message || "Render failed" });
-    }
-    if (token) cleanupToken(token);
-    if (outPath) await fsp.unlink(outPath).catch(() => {});
-    if (localVideo) await fsp.unlink(localVideo).catch(() => {});
-    if (localMusic) await fsp.unlink(localMusic).catch(() => {});
+    console.error("[render] error:", e);
+    res.status(400).json({
+      ok: false,
+      error: String(e?.message || e),
+    });
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`Remotion renderer running on ${PORT}`);
-});
+// старт
+const port = process.env.PORT || 3000;
+
+prepareRemotion()
+  .then(() => {
+    app.listen(port, () => {
+      console.log(`Server listening on :${port}`);
+    });
+  })
+  .catch((e) => {
+    console.error("Failed to start Remotion server:", e);
+    process.exit(1);
+  });
