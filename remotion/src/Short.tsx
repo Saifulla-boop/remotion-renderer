@@ -47,6 +47,7 @@ export const Short: React.FC<Props> = ({hook, videoPath, musicPath}) => {
           alignItems: "center",
         }}
       >
+        console.log("PROPS", { hook, videoPath, musicPath });
         <Video
           src={videoPath}
           style={{
