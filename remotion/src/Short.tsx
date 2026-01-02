@@ -5,28 +5,34 @@ type Props = {
   hook: string;
   description?: string;
   durationSec?: number;
+  fitMode?: "cover" | "contain";
 
-  // новые
+  // поддержка всех вариантов
   videoPath?: string;
   musicPath?: string;
 
-  // старые
+  videoUrl?: string;
+  musicUrl?: string;
+
   videoSrc?: string;
   musicSrc?: string;
 };
 
 export const Short: React.FC<Props> = (props) => {
-  const hook = props.hook ?? "";
+  const {
+    hook,
+    fitMode = "cover",
+  } = props;
 
-  // ✅ берём сначала новые, если их нет — старые
-  const video = props.videoPath ?? props.videoSrc ?? "";
-  const music = props.musicPath ?? props.musicSrc ?? "";
+  // ✅ выбираем первый непустой вариант
+  const video =
+    props.videoPath || props.videoUrl || props.videoSrc || "";
 
-  if (!video || typeof video !== "string") {
-    throw new Error("No src passed (videoPath is empty)");
-  }
-  if (!music || typeof music !== "string") {
-    throw new Error("No src passed (musicPath is empty)");
+  const music =
+    props.musicPath || props.musicUrl || props.musicSrc || "";
+
+  if (!video) {
+    throw new Error("No src passed (video is empty). Expected videoPath/videoUrl/videoSrc");
   }
 
   return (
@@ -34,13 +40,13 @@ export const Short: React.FC<Props> = (props) => {
       <AbsoluteFill>
         <Video
           src={video}
-          style={{ width: "100%", height: "100%", objectFit: "cover" }}
+          style={{ width: "100%", height: "100%", objectFit: fitMode }}
         />
       </AbsoluteFill>
 
       <AbsoluteFill style={{ backgroundColor: "rgba(0,0,0,0.35)" }} />
 
-      <Audio src={music} />
+      {music ? <Audio src={music} /> : null}
 
       <AbsoluteFill
         style={{
