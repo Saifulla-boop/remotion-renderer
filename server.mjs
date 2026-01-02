@@ -3,9 +3,8 @@ import fs from "fs";
 import path from "path";
 import os from "os";
 import { fileURLToPath } from "url";
+import { Readable } from "stream";
 import { pipeline } from "stream/promises";
-
-import { google } from "googleapis";
 
 import { bundle } from "@remotion/bundler";
 import { getCompositions, renderMedia } from "@remotion/renderer";
@@ -23,56 +22,120 @@ const COMPOSITION_ID = process.env.COMPOSITION_ID || "Short";
 
 const cleanId = (s) => String(s || "").replace(/^=+/, "").trim();
 
-function requireEnv(name) {
-  const v = process.env[name];
-  if (!v) throw new Error(`Missing env var: ${name}`);
-  return v;
+// --- Drive uc URL (с confirm)
+const driveUcUrl = (fileId, confirm) => {
+  const base = `https://drive.google.com/uc?export=download&id=${encodeURIComponent(
+    fileId
+  )}`;
+  return confirm ? `${base}&confirm=${encodeURIComponent(confirm)}` : base;
+};
+
+// download_warning токен из cookie
+function extractDownloadWarningTokenFromCookies(res) {
+  const getSetCookie = res.headers.getSetCookie?.bind(res.headers);
+  const cookies = getSetCookie ? getSetCookie() : [];
+  const fallback = res.headers.get("set-cookie");
+  if (fallback) cookies.push(fallback);
+
+  for (const c of cookies) {
+    const m = String(c).match(/download_warning[^=]*=([^;]+)/);
+    if (m) return m[1];
+  }
+  return null;
 }
 
-function getDriveClient() {
-  const clientEmail = requireEnv("GOOGLE_CLIENT_EMAIL");
-  let privateKey = requireEnv("GOOGLE_PRIVATE_KEY");
+// confirm токен из HTML
+function extractConfirmTokenFromHtml(html) {
+  const s = String(html || "");
 
-  // Railway обычно хранит ключ с \n — восстанавливаем
-  privateKey = privateKey.replace(/\\n/g, "\n");
+  let m = s.match(/confirm=([0-9A-Za-z_]+)&amp;id=/);
+  if (m) return m[1];
 
-  const auth = new google.auth.JWT({
-    email: clientEmail,
-    key: privateKey,
-    scopes: ["https://www.googleapis.com/auth/drive.readonly"],
+  m = s.match(/confirm=([0-9A-Za-z_]+)&id=/);
+  if (m) return m[1];
+
+  m = s.match(/name="confirm"\s+value="([0-9A-Za-z_]+)"/);
+  if (m) return m[1];
+
+  if (s.includes("Virus scan warning")) return "t";
+
+  return null;
+}
+
+// Одна попытка скачать по URL
+async function downloadDriveFileTo(tmpPath, url, cookieHeader) {
+  const res = await fetch(url, {
+    redirect: "follow",
+    headers: cookieHeader ? { cookie: cookieHeader } : undefined,
   });
 
-  return google.drive({ version: "v3", auth });
+  const ct = res.headers.get("content-type") || "";
+
+  // HTML -> вернём html, чтобы достать confirm
+  if (ct.toLowerCase().includes("text/html")) {
+    const html = await res.text();
+    return { ok: false, html, res };
+  }
+
+  if (!res.ok) {
+    const t = await res.text().catch(() => "");
+    throw new Error(`Drive download failed (${res.status}). ${t.slice(0, 200)}`);
+  }
+
+  if (!res.body) throw new Error("Download failed: empty body");
+
+  const fileStream = fs.createWriteStream(tmpPath);
+  await pipeline(Readable.fromWeb(res.body), fileStream);
+
+  return { ok: true, res };
 }
 
-const drive = getDriveClient();
-
-/**
- * Скачиваем файл из Google Drive по fileId во временный файл
- * ВАЖНО: service account должен иметь доступ к файлу/папке (шаринг на email service account)
- */
+// ✅ Downloader, который обходит confirm/virus scan
 async function downloadToTmp({ fileId, ext }) {
   const safeId = cleanId(fileId);
   if (!safeId) throw new Error("downloadToTmp: fileId is empty");
 
   const tmpPath = path.join(os.tmpdir(), `${Date.now()}-${safeId}.${ext}`);
 
-  // Drive API stream
-  const resp = await drive.files.get(
-    { fileId: safeId, alt: "media" },
-    { responseType: "stream" }
-  );
+  // 1) первая попытка
+  const first = await downloadDriveFileTo(tmpPath, driveUcUrl(safeId));
+  if (first.ok) {
+    const stat = fs.statSync(tmpPath);
+    if (!stat.size || stat.size < 1024) {
+      throw new Error(`Downloaded file too small (size=${stat.size}). fileId=${safeId}`);
+    }
+    return tmpPath;
+  }
 
-  if (!resp?.data) throw new Error("Drive API returned empty stream");
+  // HTML -> пытаемся извлечь confirm
+  const html = first.html || "";
+  const cookieToken = extractDownloadWarningTokenFromCookies(first.res);
+  const htmlToken = extractConfirmTokenFromHtml(html);
+  const confirm = htmlToken || cookieToken;
 
-  const out = fs.createWriteStream(tmpPath);
-  await pipeline(resp.data, out);
+  if (!confirm) {
+    const head = html.slice(0, 300).replace(/\s+/g, " ");
+    throw new Error(
+      `Drive returned HTML instead of media and confirm token not found. fileId=${safeId}. HTML head: ${head}`
+    );
+  }
+
+  const cookieHeader = cookieToken ? `download_warning=${cookieToken}` : undefined;
+
+  // 2) повторная попытка с confirm
+  try { fs.unlinkSync(tmpPath); } catch {}
+
+  const second = await downloadDriveFileTo(tmpPath, driveUcUrl(safeId, confirm), cookieHeader);
+  if (!second.ok) {
+    const head = String(second.html || "").slice(0, 300).replace(/\s+/g, " ");
+    throw new Error(
+      `Drive returned HTML again (confirm=${confirm}). fileId=${safeId}. HTML head: ${head}`
+    );
+  }
 
   const stat = fs.statSync(tmpPath);
   if (!stat.size || stat.size < 1024) {
-    throw new Error(
-      `Downloaded file too small (size=${stat.size}). fileId=${safeId}`
-    );
+    throw new Error(`Downloaded file looks wrong (size=${stat.size}). fileId=${safeId}`);
   }
 
   return tmpPath;
@@ -109,19 +172,23 @@ app.post("/render", async (req, res) => {
     const description = body.description ?? "";
     const durationSec = body.durationSec;
 
-    // ✅ поддержка обоих вариантов имен
+    // ✅ поддержка разных названий полей
     const videoFileId =
-      body.videoFileId ?? body.videoFieldId ?? body.videoFileid ?? body.videoFieldid;
+      body.videoFileId ??
+      body.videoFieldId ??
+      body.videoFileid ??
+      body.videoFieldid;
+
     const musicFileId =
-      body.musicFileId ?? body.musicFieldId ?? body.musicFileid ?? body.musicFieldid;
+      body.musicFileId ??
+      body.musicFieldId ??
+      body.musicFileid ??
+      body.musicFieldid;
 
     // ---- Валидация
-    if (!hook || typeof hook !== "string") {
-      throw new Error("hook is missing (string required)");
-    }
-    if (typeof description !== "string") {
-      throw new Error("description must be a string");
-    }
+    if (!hook || typeof hook !== "string") throw new Error("hook is missing (string required)");
+    if (typeof description !== "string") throw new Error("description must be a string");
+
     if (!videoFileId || typeof videoFileId !== "string") {
       throw new Error("videoFileId (or videoFieldId) is missing (string required)");
     }
@@ -130,9 +197,7 @@ app.post("/render", async (req, res) => {
     }
 
     const dur = Number(durationSec ?? 12);
-    if (!Number.isFinite(dur) || dur <= 0) {
-      throw new Error("durationSec must be a positive number");
-    }
+    if (!Number.isFinite(dur) || dur <= 0) throw new Error("durationSec must be a positive number");
 
     console.log("[render] incoming:", {
       hookLen: hook.length,
@@ -142,9 +207,12 @@ app.post("/render", async (req, res) => {
       durationSec: dur,
     });
 
-    // ---- Скачиваем исходники через Drive API (без confirm/virus страниц)
+    // ---- Скачиваем исходники
     const videoPath = await downloadToTmp({ fileId: videoFileId, ext: "mp4" });
     const musicPath = await downloadToTmp({ fileId: musicFileId, ext: "mp3" });
+
+    if (!videoPath) throw new Error("SERVER: videoPath is empty after download");
+    if (!musicPath) throw new Error("SERVER: musicPath is empty after download");
 
     // ---- Находим композицию
     const comps =
@@ -153,26 +221,32 @@ app.post("/render", async (req, res) => {
     const comp = comps.find((c) => c.id === COMPOSITION_ID);
     if (!comp) {
       throw new Error(
-        `Composition "${COMPOSITION_ID}" not found. Available: ${comps
-          .map((c) => c.id)
-          .join(", ")}`
+        `Composition "${COMPOSITION_ID}" not found. Available: ${comps.map((c) => c.id).join(", ")}`
       );
     }
 
     const outPath = path.join(os.tmpdir(), `render-${Date.now()}.mp4`);
 
+    // ✅ ВАЖНО: передаём ОБА варианта пропсов
     const inputProps = {
       hook,
       description,
       durationSec: dur,
+
       videoPath,
       musicPath,
+
+      // совместимость со старым
+      videoSrc: videoPath,
+      musicSrc: musicPath,
     };
 
     console.log("[render] inputProps:", {
       durationSec: inputProps.durationSec,
       videoPath: inputProps.videoPath,
       musicPath: inputProps.musicPath,
+      videoSrc: inputProps.videoSrc,
+      musicSrc: inputProps.musicSrc,
     });
 
     await renderMedia({
@@ -181,14 +255,9 @@ app.post("/render", async (req, res) => {
       codec: "h264",
       outputLocation: outPath,
       inputProps,
-
-      // если нужно — можно явно указать chromium:
-      // chromiumOptions: {
-      //   executablePath:
-      //     process.env.PUPPETEER_EXECUTABLE_PATH || process.env.CHROME_BIN,
-      // },
     });
 
+    // ---- Отдаём видео
     res.setHeader("Content-Type", "video/mp4");
     res.setHeader("Content-Disposition", `attachment; filename="short.mp4"`);
 
