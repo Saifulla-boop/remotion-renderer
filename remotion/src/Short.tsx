@@ -1,83 +1,50 @@
-import React from "react";
-import { AbsoluteFill, Audio, Video } from "remotion";
+import { AbsoluteFill, Audio, Video, useVideoConfig } from "remotion";
 
-type Props = {
+export const Short: React.FC<{
   hook: string;
   description?: string;
-  durationSec?: number;
-
-  // поддержка всех вариантов
-  videoUrl?: string;
-  musicUrl?: string;
-  videoPath?: string;
-  musicPath?: string;
-  videoSrc?: string;
+  videoSrc: string;
   musicSrc?: string;
-
-  fitMode?: "cover" | "contain";
-};
-
-export const Short: React.FC<Props> = (props) => {
-  const video =
-    props.videoPath || props.videoUrl || props.videoSrc || "";
-  const music =
-    props.musicPath || props.musicUrl || props.musicSrc || "";
-
-  if (!video) throw new Error("No src passed (video is empty)");
-
-  const fit = props.fitMode ?? "cover";
+}> = ({ hook, description, videoSrc, musicSrc }) => {
+  const { width, height } = useVideoConfig();
 
   return (
     <AbsoluteFill style={{ backgroundColor: "black" }}>
-      <AbsoluteFill>
-        <Video
-          src={video}
-          // 🔊 звук исходника (оставь 0.6 / сделай 0 если не нужен)
-          volume={0.6}
-          style={{ width: "100%", height: "100%", objectFit: fit }}
-        />
-      </AbsoluteFill>
+      {/* ВИДЕО — БЕЗ SCALE */}
+      <Video
+        src={videoSrc}
+        startFrom={0}
+        style={{
+          width,
+          height,
+        }}
+      />
 
-      <AbsoluteFill style={{ backgroundColor: "rgba(0,0,0,0.35)" }} />
+      {/* МУЗЫКА */}
+      {musicSrc && <Audio src={musicSrc} volume={0.8} />}
 
-      {music ? (
-        <Audio
-          src={music}
-          // 🔊 музыка тише
-          volume={0.8}
-        />
-      ) : null}
-
+      {/* ТЕКСТ */}
       <AbsoluteFill
         style={{
           justifyContent: "flex-end",
           alignItems: "center",
-          paddingBottom: 260,
+          paddingBottom: 120,
+          pointerEvents: "none",
         }}
       >
         <div
           style={{
-            backgroundColor: "rgba(176, 92, 30, 0.80)",
-            borderRadius: 28,
-            padding: "28px 34px",
-            maxWidth: 920,
-            width: "calc(100% - 180px)",
+            background: "rgba(0,0,0,0.55)",
+            color: "white",
+            padding: "24px 32px",
+            borderRadius: 24,
+            fontSize: 42,
+            maxWidth: "90%",
+            textAlign: "center",
+            lineHeight: 1.2,
           }}
         >
-          <div
-            style={{
-              color: "rgba(255,255,255,0.92)",
-              fontSize: 58,
-              lineHeight: 1.1,
-              fontWeight: 300,
-              letterSpacing: 0.2,
-              textAlign: "center",
-              fontFamily:
-                "Inter, -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, Arial, sans-serif",
-            }}
-          >
-            {props.hook}
-          </div>
+          {hook}
         </div>
       </AbsoluteFill>
     </AbsoluteFill>
