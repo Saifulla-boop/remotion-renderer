@@ -237,7 +237,7 @@ app.post("/render", async (req, res) => {
     if (!comp) {
       throw new Error(
         `Composition "${COMPOSITION_ID}" not found. Available: ${comps
-          .map((c) => ctòa
+          .map((c) => c.id)
           .join(", ")}`
       );
     }
