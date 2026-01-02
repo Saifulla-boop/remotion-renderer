@@ -3,8 +3,9 @@ import fs from "fs";
 import path from "path";
 import os from "os";
 import { fileURLToPath } from "url";
-import { Readable } from "stream";
 import { pipeline } from "stream/promises";
+
+import { google } from "googleapis";
 
 import { bundle } from "@remotion/bundler";
 import { getCompositions, renderMedia } from "@remotion/renderer";
@@ -22,138 +23,57 @@ const COMPOSITION_ID = process.env.COMPOSITION_ID || "Short";
 
 const cleanId = (s) => String(s || "").replace(/^=+/, "").trim();
 
-// ВАЖНО: Node 18+ имеет глобальный fetch (undici).
-// Если у тебя где-то подключен node-fetch — УДАЛИ его импорт, он тут не нужен.
-
-const driveUcUrl = (fileId, confirm) => {
-  const base = `https://drive.google.com/uc?export=download&id=${encodeURIComponent(
-    fileId
-  )}`;
-  return confirm ? `${base}&confirm=${encodeURIComponent(confirm)}` : base;
-};
-
-// Вытаскиваем cookie download_warning=TOKEN
-function extractDownloadWarningTokenFromCookies(res) {
-  const getSetCookie = res.headers.getSetCookie?.bind(res.headers);
-  const cookies = getSetCookie ? getSetCookie() : [];
-  const fallback = res.headers.get("set-cookie");
-  if (fallback) cookies.push(fallback);
-
-  for (const c of cookies) {
-    const m = String(c).match(/download_warning[^=]*=([^;]+)/);
-    if (m) return m[1];
-  }
-  return null;
+// ========= GOOGLE DRIVE (Service Account) =========
+function requireEnv(name) {
+  const v = process.env[name];
+  if (!v) throw new Error(`Missing env var: ${name}`);
+  return v;
 }
 
-// Вытаскиваем confirm токен из HTML (разные варианты разметки у Drive)
-function extractConfirmTokenFromHtml(html) {
-  const s = String(html || "");
+function getDriveClient() {
+  const clientEmail = requireEnv("GOOGLE_CLIENT_EMAIL");
+  let privateKey = requireEnv("GOOGLE_PRIVATE_KEY");
 
-  // иногда в ссылке: confirm=XXXX&id=...
-  let m = s.match(/confirm=([0-9A-Za-z_]+)&amp;id=/);
-  if (m) return m[1];
+  // Railway часто хранит ключ с \n как текст — восстанавливаем:
+  privateKey = privateKey.replace(/\\n/g, "\n");
 
-  m = s.match(/confirm=([0-9A-Za-z_]+)&id=/);
-  if (m) return m[1];
-
-  // иногда hidden input: name="confirm" value="XXXX"
-  m = s.match(/name="confirm"\s+value="([0-9A-Za-z_]+)"/);
-  if (m) return m[1];
-
-  // иногда просто “confirm=t” (на вирус-странице часто так)
-  if (s.includes("Virus scan warning")) return "t";
-
-  return null;
-}
-
-function looksLikeHtml(contentType, bufOrText) {
-  const ct = (contentType || "").toLowerCase();
-  if (ct.includes("text/html")) return true;
-  const head = typeof bufOrText === "string" ? bufOrText.slice(0, 400) : "";
-  return head.includes("<!doctype") || head.includes("<html");
-}
-
-async function downloadDriveFileTo(tmpPath, url, cookieHeader) {
-  const res = await fetch(url, {
-    redirect: "follow",
-    headers: cookieHeader ? { cookie: cookieHeader } : undefined,
+  const auth = new google.auth.JWT({
+    email: clientEmail,
+    key: privateKey,
+    scopes: ["https://www.googleapis.com/auth/drive.readonly"],
   });
 
-  const ct = res.headers.get("content-type") || "";
-
-  // Если это HTML — читаем текст, чтобы распарсить confirm
-  if (ct.toLowerCase().includes("text/html")) {
-    const html = await res.text();
-    return { ok: false, html, res };
-  }
-
-  if (!res.ok) {
-    const t = await res.text().catch(() => "");
-    throw new Error(`Drive download failed (${res.status}). ${t.slice(0, 200)}`);
-  }
-
-  if (!res.body) throw new Error("Download failed: empty body");
-
-  const fileStream = fs.createWriteStream(tmpPath);
-  await pipeline(Readable.fromWeb(res.body), fileStream);
-
-  return { ok: true, res };
+  return google.drive({ version: "v3", auth });
 }
 
-// ✅ НОРМАЛЬНЫЙ ДРАЙВ-ДАУНЛОАДЕР (обходит confirm/virus scan)
+const drive = getDriveClient();
+
+/**
+ * Скачиваем файл из Drive API во временный файл
+ * Обходит confirm/virus-scan и "Drive returned HTML"
+ */
 async function downloadToTmp({ fileId, ext }) {
   const safeId = cleanId(fileId);
   if (!safeId) throw new Error("downloadToTmp: fileId is empty");
 
   const tmpPath = path.join(os.tmpdir(), `${Date.now()}-${safeId}.${ext}`);
+  const dest = fs.createWriteStream(tmpPath);
 
-  // 1) первая попытка
-  const firstUrl = driveUcUrl(safeId);
-  const first = await downloadDriveFileTo(tmpPath, firstUrl);
-
-  if (first.ok) {
-    const stat = fs.statSync(tmpPath);
-    if (!stat.size || stat.size < 1024) {
-      throw new Error(
-        `Downloaded file too small (size=${stat.size}). fileId=${safeId}`
-      );
-    }
-    return tmpPath;
-  }
-
-  // сюда попали, если пришёл HTML
-  const html = first.html || "";
-  const cookieToken = extractDownloadWarningTokenFromCookies(first.res);
-  const htmlToken = extractConfirmTokenFromHtml(html);
-
-  const confirm = htmlToken || cookieToken;
-
-  if (!confirm) {
-    // покажем кусок HTML заголовка, чтобы ты видел, что реально пришло
-    const head = html.slice(0, 300).replace(/\s+/g, " ");
-    throw new Error(
-      `Drive returned HTML instead of media and confirm token not found. fileId=${safeId}. HTML head: ${head}`
+  let resp;
+  try {
+    resp = await drive.files.get(
+      { fileId: safeId, alt: "media" },
+      { responseType: "stream" }
     );
+  } catch (e) {
+    // частые причины: нет доступа, файл не найден, не расшарено на service account
+    const msg = e?.response?.data?.error?.message || e?.message || String(e);
+    throw new Error(`Drive API download failed for fileId=${safeId}: ${msg}`);
   }
 
-  // cookie для второго запроса (если token пришёл из cookie)
-  // если token из HTML — cookie обычно не обязателен, но не мешает
-  const cookieHeader = cookieToken ? `download_warning=${cookieToken}` : undefined;
+  if (!resp?.data) throw new Error(`Drive API: empty stream for fileId=${safeId}`);
 
-  // 2) вторая попытка с confirm
-  const secondUrl = driveUcUrl(safeId, confirm);
-
-  // удалим если успел записаться html/мусор
-  try { fs.unlinkSync(tmpPath); } catch {}
-
-  const second = await downloadDriveFileTo(tmpPath, secondUrl, cookieHeader);
-  if (!second.ok) {
-    const head = String(second.html || "").slice(0, 300).replace(/\s+/g, " ");
-    throw new Error(
-      `Drive returned HTML again (confirm=${confirm}). fileId=${safeId}. HTML head: ${head}`
-    );
-  }
+  await pipeline(resp.data, dest);
 
   const stat = fs.statSync(tmpPath);
   if (!stat.size || stat.size < 1024) {
@@ -165,6 +85,7 @@ async function downloadToTmp({ fileId, ext }) {
   return tmpPath;
 }
 
+// ========= REMOTION =========
 let bundleLocation = null;
 let compositionsCache = null;
 
@@ -202,10 +123,12 @@ app.post("/render", async (req, res) => {
     const musicFileId =
       body.musicFileId ?? body.musicFieldId ?? body.musicFileid ?? body.musicFieldid;
 
-    if (!hook || typeof hook !== "string")
+    if (!hook || typeof hook !== "string") {
       throw new Error("hook is missing (string required)");
-    if (typeof description !== "string")
+    }
+    if (typeof description !== "string") {
       throw new Error("description must be a string");
+    }
 
     if (!videoFileId || typeof videoFileId !== "string") {
       throw new Error("videoFileId (or videoFieldId) is missing (string required)");
@@ -215,8 +138,9 @@ app.post("/render", async (req, res) => {
     }
 
     const dur = Number(durationSec ?? 12);
-    if (!Number.isFinite(dur) || dur <= 0)
+    if (!Number.isFinite(dur) || dur <= 0) {
       throw new Error("durationSec must be a positive number");
+    }
 
     console.log("[render] incoming:", {
       hookLen: hook.length,
@@ -226,7 +150,7 @@ app.post("/render", async (req, res) => {
       durationSec: dur,
     });
 
-    // ---- Скачиваем исходники (тут была проблема)
+    // ---- Скачиваем исходники через Drive API
     const videoPath = await downloadToTmp({ fileId: videoFileId, ext: "mp4" });
     const musicPath = await downloadToTmp({ fileId: musicFileId, ext: "mp3" });
 
@@ -273,9 +197,15 @@ app.post("/render", async (req, res) => {
     stream.pipe(res);
 
     stream.on("close", () => {
-      try { fs.unlinkSync(outPath); } catch {}
-      try { fs.unlinkSync(videoPath); } catch {}
-      try { fs.unlinkSync(musicPath); } catch {}
+      try {
+        fs.unlinkSync(outPath);
+      } catch {}
+      try {
+        fs.unlinkSync(videoPath);
+      } catch {}
+      try {
+        fs.unlinkSync(musicPath);
+      } catch {}
     });
   } catch (e) {
     console.error("[render] error:", e);
