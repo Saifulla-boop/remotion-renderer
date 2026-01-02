@@ -4,7 +4,6 @@ import path from "path";
 import fs from "fs";
 import fsp from "fs/promises";
 import crypto from "crypto";
-import { spawn } from "child_process";
 
 import { bundle } from "@remotion/bundler";
 import { renderMedia, selectComposition } from "@remotion/renderer";
@@ -13,12 +12,20 @@ import { google } from "googleapis";
 const app = express();
 app.use(express.json({ limit: "10mb" }));
 
-const PORT = process.env.PORT || 3000;
+// -------------------- CONFIG --------------------
+const PORT = Number(process.env.PORT || 3000);
+const COMPOSITION_ID = process.env.COMPOSITION_ID || "Short";
 const OUTPUT_FPS = Number(process.env.OUTPUT_FPS || 30);
+
+// сколько хранить результаты (минуты)
+const JOB_TTL_MIN = Number(process.env.JOB_TTL_MIN || 60);
+// как часто чистить (секунды)
+const JOB_CLEANUP_EVERY_SEC = Number(process.env.JOB_CLEANUP_EVERY_SEC || 60);
+
 const MIN_SEC = 6;
 const MAX_SEC = 30;
 
-// -------------------- Google Drive (Service Account, READONLY) --------------------
+// -------------------- Drive (Service Account, READONLY) --------------------
 function getDrive() {
   const email = process.env.GOOGLE_CLIENT_EMAIL;
   const keyRaw = process.env.GOOGLE_PRIVATE_KEY;
@@ -40,6 +47,7 @@ function getDrive() {
 
 async function downloadFromDrive(fileId, outPath) {
   const drive = getDrive();
+
   const res = await drive.files.get(
     { fileId, alt: "media" },
     { responseType: "stream" }
@@ -58,92 +66,13 @@ async function downloadFromDrive(fileId, outPath) {
   return outPath;
 }
 
-// -------------------- spawn helper --------------------
-function run(cmd, args, { timeoutMs = 10 * 60 * 1000 } = {}) {
-  return new Promise((resolve, reject) => {
-    const p = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"] });
-
-    let out = "";
-    let err = "";
-
-    const t = setTimeout(() => {
-      p.kill("SIGKILL");
-      reject(new Error(`${cmd} timeout`));
-    }, timeoutMs);
-
-    p.stdout.on("data", (d) => (out += d.toString()));
-    p.stderr.on("data", (d) => (err += d.toString()));
-
-    p.on("close", (code) => {
-      clearTimeout(t);
-      if (code === 0) return resolve({ out, err });
-      reject(new Error(`${cmd} failed (${code})\n${err || out}`));
-    });
-  });
-}
-
-// -------------------- MINIMAL normalize to MP4 (H.264) --------------------
-// Делает видео "съедобным" для Chromium в Docker:
-// - mp4 контейнер
-// - H.264
-// - yuv420p
-// - +faststart
-// - сохраняет (если есть) исходный звук, чтобы голос не пропадал
-async function normalizeToMp4H264(inPath, outPath) {
-  await run("ffmpeg", [
-    "-y",
-    "-hide_banner",
-    "-loglevel",
-    "error",
-    "-i",
-    inPath,
-
-    // видео: H.264 + yuv420p + чётные размеры
-    "-vf",
-    "scale=trunc(iw/2)*2:trunc(ih/2)*2",
-    "-c:v",
-    "libx264",
-    "-pix_fmt",
-    "yuv420p",
-    "-profile:v",
-    "high",
-    "-level",
-    "4.2",
-    "-preset",
-    "fast",
-    "-crf",
-    "20",
-
-    // аудио: оставляем, если есть (0:a?) и делаем совместимое AAC
-    "-map",
-    "0:v:0",
-    "-map",
-    "0:a?",
-    "-c:a",
-    "aac",
-    "-b:a",
-    "192k",
-    "-ar",
-    "48000",
-
-    "-movflags",
-    "+faststart",
-    outPath,
-  ]);
-
-  const stat = fs.statSync(outPath);
-  if (!stat.size || stat.size < 1024) {
-    throw new Error(`Normalized file too small (${stat.size})`);
-  }
-  return outPath;
-}
-
-// -------------------- Local assets served via HTTP (Chromium needs HTTP) --------------------
+// -------------------- Asset serving (for Chromium) --------------------
 const ASSETS = new Map(); // token -> { videoPath, musicPath?, expiresAt }
 
 function createToken() {
   return crypto.randomBytes(16).toString("hex");
 }
+
 function registerAssets({ videoPath, musicPath }) {
   const token = createToken();
   ASSETS.set(token, {
@@ -153,6 +82,7 @@ function registerAssets({ videoPath, musicPath }) {
   });
   return token;
 }
+
 function cleanupToken(token) {
   ASSETS.delete(token);
 }
@@ -162,9 +92,9 @@ setInterval(() => {
   for (const [token, v] of ASSETS.entries()) {
     if (v.expiresAt < now) ASSETS.delete(token);
   }
-}, 2 * 60 * 1000);
+}, 60 * 1000);
 
-// Range support — важно для стабильного чтения медиа Chromium’ом
+// Range support (Chromium любит range)
 function addRangeSupport(req, res, filePath, contentType) {
   const stat = fs.statSync(filePath);
   const fileSize = stat.size;
@@ -187,10 +117,9 @@ function addRangeSupport(req, res, filePath, contentType) {
 
   if (start >= fileSize || end >= fileSize) return res.status(416).end();
 
-  const chunkSize = end - start + 1;
   res.status(206);
   res.setHeader("Content-Range", `bytes ${start}-${end}/${fileSize}`);
-  res.setHeader("Content-Length", chunkSize);
+  res.setHeader("Content-Length", end - start + 1);
 
   fs.createReadStream(filePath, { start, end }).pipe(res);
 }
@@ -209,94 +138,147 @@ app.get("/asset/:token/music", (req, res) => {
 
 // -------------------- Remotion bundle cache --------------------
 let serveUrl = null;
+
 async function getBundle() {
   if (serveUrl) return serveUrl;
+  console.log("[remotion] bundling...");
   serveUrl = await bundle({
     entryPoint: path.join(process.cwd(), "remotion", "src", "index.ts"),
   });
+  console.log("[remotion] bundle ready:", serveUrl);
   return serveUrl;
 }
 
-// -------------------- Routes --------------------
-app.get("/health", (_, res) => res.json({ ok: true }));
+// -------------------- JOB QUEUE (in-memory) --------------------
+/**
+ * status:
+ *  - queued
+ *  - rendering
+ *  - done
+ *  - error
+ */
+const JOBS = new Map(); // jobId -> job
 
-app.post("/render", async (req, res) => {
-  let localVideoIn = null;
-  let localVideoMp4 = null;
-  let localMusic = null;
-  let outPath = null;
-  let token = null;
+function newJobId() {
+  // Node 18 имеет randomUUID
+  return crypto.randomUUID ? crypto.randomUUID() : crypto.randomBytes(16).toString("hex");
+}
+
+function nowIso() {
+  return new Date().toISOString();
+}
+
+function safeStr(x) {
+  return typeof x === "string" ? x : "";
+}
+
+// автоочистка job’ов + файлов
+async function cleanupOldJobs() {
+  const ttlMs = JOB_TTL_MIN * 60 * 1000;
+  const now = Date.now();
+
+  for (const [id, job] of JOBS.entries()) {
+    const age = now - job.createdAt;
+    const canDelete =
+      age > ttlMs && (job.status === "done" || job.status === "error");
+
+    if (!canDelete) continue;
+
+    try {
+      if (job.assetToken) cleanupToken(job.assetToken);
+      if (job.outPath) await fsp.unlink(job.outPath).catch(() => {});
+      if (job.localVideo) await fsp.unlink(job.localVideo).catch(() => {});
+      if (job.localMusic) await fsp.unlink(job.localMusic).catch(() => {});
+    } catch {}
+
+    JOBS.delete(id);
+    console.log(`[jobs] cleaned ${id}`);
+  }
+}
+
+setInterval(() => {
+  cleanupOldJobs().catch(() => {});
+}, JOB_CLEANUP_EVERY_SEC * 1000);
+
+// -------------------- Core render worker --------------------
+async function processJob(jobId) {
+  const job = JOBS.get(jobId);
+  if (!job) return;
+
+  job.status = "rendering";
+  job.startedAt = Date.now();
+  job.progress = 0;
+  job.updatedAtIso = nowIso();
+
+  console.log(`[job ${jobId}] start`);
+
+  let assetToken = null;
 
   try {
-    const body = req.body || {};
-
-    const hook = body.hook ?? "";
-    const description = body.description ?? "";
-    const durationSec = body.durationSec;
-
-    // поддержка разных имен входных полей (Unisender/твои узлы)
-    const videoFileId =
-      body.videoFileId ?? body.videoFieldId ?? body.videoFileid ?? body.videoFieldid;
-    const musicFileId =
-      body.musicFileId ?? body.musicFieldId ?? body.musicFileid ?? body.musicFieldid;
-
-    if (!videoFileId) return res.status(400).json({ error: "videoFileId required" });
-
-    const duration = Number.isFinite(Number(durationSec))
-      ? Math.min(Math.max(Number(durationSec), MIN_SEC), MAX_SEC)
-      : 12;
-
     const serve = await getBundle();
 
-    // 1) download video + music from Drive
-    localVideoIn = path.join(os.tmpdir(), `in-video-${Date.now()}-${crypto.randomBytes(4).toString("hex")}.bin`);
-    await downloadFromDrive(videoFileId, localVideoIn);
+    // 1) download sources
+    const localVideo = path.join(os.tmpdir(), `job-${jobId}-video.mp4`);
+    await downloadFromDrive(job.payload.videoFileId, localVideo);
 
-    if (musicFileId) {
-      localMusic = path.join(os.tmpdir(), `in-music-${Date.now()}-${crypto.randomBytes(4).toString("hex")}.mp3`);
-      await downloadFromDrive(musicFileId, localMusic);
+    let localMusic = null;
+    if (job.payload.musicFileId) {
+      localMusic = path.join(os.tmpdir(), `job-${jobId}-music.mp3`);
+      await downloadFromDrive(job.payload.musicFileId, localMusic);
     }
 
-    // 2) minimal normalize video to mp4/h264 for Chromium
-    localVideoMp4 = path.join(os.tmpdir(), `in-video-${Date.now()}-${crypto.randomBytes(4).toString("hex")}.mp4`);
-    await normalizeToMp4H264(localVideoIn, localVideoMp4);
+    job.localVideo = localVideo;
+    job.localMusic = localMusic;
 
-    // 3) serve sources via HTTP
-    token = registerAssets({ videoPath: localVideoMp4, musicPath: localMusic });
+    // 2) register local assets and create URLs for Chromium
+    assetToken = registerAssets({ videoPath: localVideo, musicPath: localMusic });
+    job.assetToken = assetToken;
+
     const baseUrl = `http://127.0.0.1:${PORT}`;
-    const videoUrl = `${baseUrl}/asset/${token}/video`;
-    const musicUrl = localMusic ? `${baseUrl}/asset/${token}/music` : "";
+    const videoUrl = `${baseUrl}/asset/${assetToken}/video`;
+    const musicUrl = localMusic ? `${baseUrl}/asset/${assetToken}/music` : "";
 
-    // 4) inputProps (и для старого, и для нового названия пропсов)
+    // 3) inputProps (передаём ВСЕ варианты имён)
     const inputProps = {
-      hook: String(hook),
-      description: String(description),
-      durationSec: duration,
+      hook: safeStr(job.payload.hook),
+      description: safeStr(job.payload.description),
+      durationSec: job.payload.durationSec,
 
-      // most common
       videoUrl,
       musicUrl,
 
-      // fallbacks for different implementations in Short.tsx
       videoSrc: videoUrl,
       musicSrc: musicUrl,
+
       videoPath: videoUrl,
       musicPath: musicUrl,
+
+      // громкость
+      videoVolume: job.payload.videoVolume,
+      musicVolume: job.payload.musicVolume,
     };
 
+    // 4) select composition (валидируем что всё ок)
     const composition = await selectComposition({
       serveUrl: serve,
-      id: "Short",
+      id: COMPOSITION_ID,
       inputProps,
     });
 
-    outPath = path.join(os.tmpdir(), `out-${Date.now()}-${crypto.randomBytes(4).toString("hex")}.mp4`);
+    // 5) output
+    const outPath = path.join(os.tmpdir(), `job-${jobId}-out.mp4`);
+    job.outPath = outPath;
+
+    const durationInFrames = Math.round(job.payload.durationSec * OUTPUT_FPS);
+
+    // 6) render with progress logs
+    let lastLog = 0;
 
     await renderMedia({
       composition: {
         ...composition,
         fps: OUTPUT_FPS,
-        durationInFrames: Math.round(duration * OUTPUT_FPS),
+        durationInFrames,
       },
       serveUrl: serve,
       codec: "h264",
@@ -304,46 +286,191 @@ app.post("/render", async (req, res) => {
       outputLocation: outPath,
       inputProps,
 
-      // стабильность в Docker
+      // стабильность в контейнере
       chromiumOptions: {
-        args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
+        args: [
+          "--no-sandbox",
+          "--disable-setuid-sandbox",
+          "--disable-dev-shm-usage",
+        ],
       },
 
-      // чтобы не рвало CPU и не было "дёрганья" от нехватки ресурсов
+      // чтобы не убивать CPU пиками
       concurrency: 1,
 
-      // таймауты
-      timeoutInMilliseconds: 10 * 60 * 1000,
-      delayRenderTimeoutInMilliseconds: 5 * 60 * 1000,
+      // таймауты — увеличены, но они теперь редко нужны (мы не держим HTTP)
+      timeoutInMilliseconds: 30 * 60 * 1000,
+      delayRenderTimeoutInMilliseconds: 10 * 60 * 1000,
+
+      onProgress: (p) => {
+        // Remotion может отдавать разные поля, берём максимально надёжно
+        const overall =
+          typeof p?.overallProgress === "number"
+            ? p.overallProgress
+            : typeof p?.progress === "number"
+            ? p.progress
+            : null;
+
+        if (overall !== null) job.progress = Math.max(0, Math.min(1, overall));
+
+        job.updatedAtIso = nowIso();
+
+        const nowT = Date.now();
+        if (nowT - lastLog > 1500) {
+          lastLog = nowT;
+          const percent = Math.round((job.progress || 0) * 100);
+          console.log(`[job ${jobId}] progress ${percent}%`);
+        }
+      },
     });
 
-    res.setHeader("Content-Type", "video/mp4");
-    res.setHeader("Content-Disposition", `attachment; filename="short.mp4"`);
-    fs.createReadStream(outPath).pipe(res);
+    // sanity
+    const stat = fs.statSync(outPath);
+    if (!stat.size || stat.size < 1024) throw new Error("Output mp4 is too small");
 
-    res.on("close", async () => {
-      try {
-        if (token) cleanupToken(token);
-        if (outPath) await fsp.unlink(outPath).catch(() => {});
-        if (localVideoIn) await fsp.unlink(localVideoIn).catch(() => {});
-        if (localVideoMp4) await fsp.unlink(localVideoMp4).catch(() => {});
-        if (localMusic) await fsp.unlink(localMusic).catch(() => {});
-      } catch {}
-    });
+    job.status = "done";
+    job.finishedAt = Date.now();
+    job.progress = 1;
+    job.updatedAtIso = nowIso();
+
+    console.log(
+      `[job ${jobId}] done in ${Math.round((job.finishedAt - job.startedAt) / 1000)}s`
+    );
   } catch (e) {
-    console.error("[render] error:", e);
-    if (!res.headersSent) res.status(500).json({ error: e?.message || "Render failed" });
+    job.status = "error";
+    job.error = String(e?.message || e);
+    job.finishedAt = Date.now();
+    job.updatedAtIso = nowIso();
 
-    try {
-      if (token) cleanupToken(token);
-      if (outPath) await fsp.unlink(outPath).catch(() => {});
-      if (localVideoIn) await fsp.unlink(localVideoIn).catch(() => {});
-      if (localVideoMp4) await fsp.unlink(localVideoMp4).catch(() => {});
-      if (localMusic) await fsp.unlink(localMusic).catch(() => {});
-    } catch {}
+    console.log(`[job ${jobId}] ERROR:`, job.error);
+  } finally {
+    // asset token держим — нужен до скачивания результата.
+    // автоочистка удалит позже по TTL.
+  }
+}
+
+// -------------------- Routes --------------------
+app.get("/health", (_, res) => res.json({ ok: true }));
+
+/**
+ * POST /render
+ * body: { hook, description, durationSec, videoFileId, musicFileId?, videoVolume?, musicVolume? }
+ * returns: { jobId }
+ */
+app.post("/render", (req, res) => {
+  try {
+    const body = req.body || {};
+
+    const videoFileId =
+      body.videoFileId ??
+      body.videoFieldId ??
+      body.videoFileid ??
+      body.videoFieldid;
+
+    const musicFileId =
+      body.musicFileId ??
+      body.musicFieldId ??
+      body.musicFileid ??
+      body.musicFieldid;
+
+    if (!videoFileId) {
+      return res.status(400).json({ ok: false, error: "videoFileId required" });
+    }
+
+    const duration = Number.isFinite(Number(body.durationSec))
+      ? Math.min(Math.max(Number(body.durationSec), MIN_SEC), MAX_SEC)
+      : 12;
+
+    const jobId = newJobId();
+
+    JOBS.set(jobId, {
+      id: jobId,
+      status: "queued",
+      progress: 0,
+      error: null,
+
+      createdAt: Date.now(),
+      createdAtIso: nowIso(),
+      updatedAtIso: nowIso(),
+
+      // всё, что нужно рендеру
+      payload: {
+        hook: safeStr(body.hook),
+        description: safeStr(body.description),
+        durationSec: duration,
+
+        videoFileId: String(videoFileId),
+        musicFileId: musicFileId ? String(musicFileId) : "",
+
+        // громкости (опционально)
+        videoVolume:
+          typeof body.videoVolume === "number" ? body.videoVolume : 1,
+        musicVolume:
+          typeof body.musicVolume === "number" ? body.musicVolume : 0.35,
+      },
+
+      // runtime fields
+      startedAt: null,
+      finishedAt: null,
+      outPath: null,
+      localVideo: null,
+      localMusic: null,
+      assetToken: null,
+    });
+
+    // запускаем рендер в фоне
+    setImmediate(() => processJob(jobId));
+
+    return res.json({ ok: true, jobId });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 });
 
+/**
+ * GET /status/:jobId
+ * returns status + progress + error
+ */
+app.get("/status/:jobId", (req, res) => {
+  const job = JOBS.get(req.params.jobId);
+  if (!job) return res.status(404).json({ ok: false, error: "Job not found" });
+
+  return res.json({
+    ok: true,
+    jobId: job.id,
+    status: job.status,
+    progress: job.progress ?? 0,
+    error: job.error,
+    createdAt: job.createdAtIso,
+    updatedAt: job.updatedAtIso,
+  });
+});
+
+/**
+ * GET /download/:jobId
+ * returns mp4 file (attachment)
+ */
+app.get("/download/:jobId", (req, res) => {
+  const job = JOBS.get(req.params.jobId);
+  if (!job) return res.status(404).send("Job not found");
+
+  if (job.status !== "done" || !job.outPath) {
+    return res.status(409).send("Not ready");
+  }
+
+  if (!fs.existsSync(job.outPath)) {
+    return res.status(410).send("File missing");
+  }
+
+  // отдаём файлом (как ты и сделал — на телефонах это лучше)
+  res.setHeader("Content-Type", "video/mp4");
+  res.setHeader("Content-Disposition", `attachment; filename="short-${job.id}.mp4"`);
+
+  fs.createReadStream(job.outPath).pipe(res);
+});
+
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`Remotion renderer running on ${PORT} (OUTPUT_FPS=${OUTPUT_FPS})`);
+  console.log(`Remotion renderer async running on ${PORT}`);
+  console.log(`COMPOSITION_ID=${COMPOSITION_ID}, OUTPUT_FPS=${OUTPUT_FPS}`);
+  console.log(`JOB_TTL_MIN=${JOB_TTL_MIN}, CLEANUP_EVERY_SEC=${JOB_CLEANUP_EVERY_SEC}`);
 });
