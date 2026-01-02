@@ -4,6 +4,7 @@
   "type": "module",
   "scripts": {
     "start": "node server.mjs"
+  
   },
   "dependencies": {
     "@remotion/bundler": "^4.0.0",
