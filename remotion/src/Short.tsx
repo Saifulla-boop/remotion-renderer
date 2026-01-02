@@ -3,75 +3,76 @@ import {
   AbsoluteFill,
   Audio,
   Video,
-  useVideoConfig,
 } from "remotion";
 
 type Props = {
   hook: string;
-  description: string;
+  description?: string;
   durationSec?: number;
-  videoPath: string; // <-- важно
-  musicPath: string; // <-- важно
+  videoPath: string; // важно: именно videoPath
+  musicPath: string; // важно: именно musicPath
 };
 
-export const Short: React.FC<Props> = (props) => {
-  const { hook, description, videoPath, musicPath } = props;
-  const { width, height } = useVideoConfig();
-
+export const Short: React.FC<Props> = ({
+  hook,
+  videoPath,
+  musicPath,
+}) => {
+  // Явная, понятная ошибка (чтобы сразу видеть, что именно пустое)
   if (!videoPath || typeof videoPath !== "string") {
-    throw new Error(`No src passed (videoPath is empty)`);
+    throw new Error("No src passed (videoPath is empty)");
   }
   if (!musicPath || typeof musicPath !== "string") {
-    throw new Error(`No src passed (musicPath is empty)`);
+    throw new Error("No src passed (musicPath is empty)");
   }
 
   return (
     <AbsoluteFill style={{ backgroundColor: "black" }}>
       {/* Видео */}
-      <Video
-        src={videoPath}
-        style={{ width, height, objectFit: "cover" }}
-      />
+      <AbsoluteFill>
+        <Video
+          src={videoPath}
+          style={{ width: "100%", height: "100%", objectFit: "cover" }}
+        />
+      </AbsoluteFill>
+
+      {/* Притемнение как в рефе */}
+      <AbsoluteFill style={{ backgroundColor: "rgba(0,0,0,0.35)" }} />
 
       {/* Музыка */}
       <Audio src={musicPath} />
 
-      {/* Текст — пока базово, позже доведем до референса */}
+      {/* Подложка + текст (нижняя треть, по центру) */}
       <AbsoluteFill
         style={{
-          justifyContent: "center",
+          justifyContent: "flex-end",
           alignItems: "center",
-          padding: 80,
+          paddingBottom: 260, // можно чуть двигать вверх/вниз под реф
         }}
       >
         <div
           style={{
-            maxWidth: 900,
-            fontSize: 54,
-            lineHeight: 1.15,
-            color: "white",
-            fontWeight: 600,
-            textAlign: "center",
-            background: "rgba(0,0,0,0.35)",
-            padding: "22px 28px",
-            borderRadius: 18,
+            backgroundColor: "rgba(176, 92, 30, 0.80)", // оранжевый как на рефе
+            borderRadius: 28,
+            padding: "28px 34px",
+            maxWidth: 920,
+            width: "calc(100% - 180px)",
           }}
         >
-          {hook}
-        </div>
-
-        <div
-          style={{
-            marginTop: 22,
-            maxWidth: 980,
-            fontSize: 34,
-            lineHeight: 1.25,
-            color: "rgba(255,255,255,0.9)",
-            textAlign: "center",
-            textShadow: "0 2px 10px rgba(0,0,0,0.4)",
-          }}
-        >
-          {description}
+          <div
+            style={{
+              color: "rgba(255,255,255,0.92)",
+              fontSize: 58,
+              lineHeight: 1.1,
+              fontWeight: 300,
+              letterSpacing: 0.2,
+              textAlign: "center",
+              fontFamily:
+                "Inter, -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, Arial, sans-serif",
+            }}
+          >
+            {hook}
+          </div>
         </div>
       </AbsoluteFill>
     </AbsoluteFill>
