@@ -18,56 +18,58 @@ const PORT = Number(process.env.PORT || 3000);
 const COMPOSITION_ID = process.env.COMPOSITION_ID || "Short";
 const OUTPUT_FPS = Number(process.env.OUTPUT_FPS || 30);
 
-// сколько хранить результаты (минуты)
 const JOB_TTL_MIN = Number(process.env.JOB_TTL_MIN || 60);
-// как часто чистить (секунды)
 const JOB_CLEANUP_EVERY_SEC = Number(process.env.JOB_CLEANUP_EVERY_SEC || 60);
 
 const MIN_SEC = 6;
 const MAX_SEC = 30;
 
-// ffmpeg настройки (можно тюнить без правок кода)
-const FFMPEG_CRF = process.env.FFMPEG_CRF || "23"; // меньше = качество выше, но медленнее
-const FFMPEG_PRESET = process.env.FFMPEG_PRESET || "veryfast"; // veryfast / faster / fast
+// Ускорение рендера
+// Railway часто дает 2 vCPU — поэтому по умолчанию 2, но можно поднять env’ом.
+const RENDER_CONCURRENCY = Number(process.env.RENDER_CONCURRENCY || 2);
+
+// Размер кэша для offthread video (чтобы меньше дергать диск/декодер)
+const OFFTHREAD_CACHE_MB = Number(process.env.OFFTHREAD_CACHE_MB || 512);
+
+// Конвертация “для Chromium”
+const ENABLE_CHROMIUM_FIX = (process.env.ENABLE_CHROMIUM_FIX ?? "1") !== "0";
 
 // -------------------- helpers --------------------
 function nowIso() {
   return new Date().toISOString();
 }
-
 function safeStr(x) {
   return typeof x === "string" ? x : "";
 }
-
 function newJobId() {
   return crypto.randomUUID ? crypto.randomUUID() : crypto.randomBytes(16).toString("hex");
 }
-
-// Запуск команд (ffmpeg)
-function run(cmd, args, { timeoutMs = 10 * 60 * 1000 } = {}) {
+function run(cmd, args, { timeoutMs } = {}) {
   return new Promise((resolve, reject) => {
-    const child = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"] });
+    const p = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"] });
+    let out = "";
+    let err = "";
 
-    let stdout = "";
-    let stderr = "";
+    const timer =
+      timeoutMs != null
+        ? setTimeout(() => {
+            p.kill("SIGKILL");
+            reject(new Error(`${cmd} timeout after ${timeoutMs}ms`));
+          }, timeoutMs)
+        : null;
 
-    child.stdout.on("data", (d) => (stdout += d.toString()));
-    child.stderr.on("data", (d) => (stderr += d.toString()));
+    p.stdout.on("data", (d) => (out += d.toString()));
+    p.stderr.on("data", (d) => (err += d.toString()));
 
-    const t = setTimeout(() => {
-      child.kill("SIGKILL");
-      reject(new Error(`${cmd} timeout after ${timeoutMs}ms\n${stderr}`));
-    }, timeoutMs);
-
-    child.on("error", (err) => {
-      clearTimeout(t);
-      reject(err);
+    p.on("error", (e) => {
+      if (timer) clearTimeout(timer);
+      reject(e);
     });
 
-    child.on("close", (code) => {
-      clearTimeout(t);
-      if (code === 0) return resolve({ stdout, stderr });
-      reject(new Error(`${cmd} exited with code ${code}\n${stderr}`));
+    p.on("close", (code) => {
+      if (timer) clearTimeout(timer);
+      if (code === 0) return resolve({ out, err });
+      reject(new Error(`${cmd} exited ${code}\n${err || out}`));
     });
   });
 }
@@ -113,52 +115,12 @@ async function downloadFromDrive(fileId, outPath) {
   return outPath;
 }
 
-// -------------------- ✅ Минимальная конвертация “для Chromium” --------------------
-// ВАЖНО: не remux, а перекод в H.264, иначе HEVC (айфон) даст Code 4 и progress=0
-async function prepareVideoForChromium(inputPath, jobId) {
-  const outTranscode = path.join(os.tmpdir(), `job-${jobId}-video-x264.mp4`);
-
-  console.log(`[job ${jobId}] ffmpeg transcode -> H.264 (${FFMPEG_PRESET}, crf=${FFMPEG_CRF})`);
-
-  await run(
-    "ffmpeg",
-    [
-      "-y",
-      "-i",
-      inputPath,
-
-      // видео (Chromium-safe)
-      "-c:v", "libx264",
-      "-preset", FFMPEG_PRESET,
-      "-crf", String(FFMPEG_CRF),
-      "-pix_fmt", "yuv420p",
-
-      // аудио (на всякий случай)
-      "-c:a", "aac",
-      "-b:a", "128k",
-
-      // быстрый старт mp4
-      "-movflags", "+faststart",
-
-      outTranscode,
-    ],
-    { timeoutMs: 25 * 60 * 1000 }
-  );
-
-  const st = fs.statSync(outTranscode);
-  if (!st.size || st.size < 1024) throw new Error("ffmpeg transcode produced empty file");
-
-  console.log(`[job ${jobId}] ffmpeg OK (${Math.round(st.size / 1024 / 1024)}MB)`);
-  return outTranscode;
-}
-
 // -------------------- Asset serving (for Chromium) --------------------
 const ASSETS = new Map(); // token -> { videoPath, musicPath?, expiresAt }
 
 function createToken() {
   return crypto.randomBytes(16).toString("hex");
 }
-
 function registerAssets({ videoPath, musicPath }) {
   const token = createToken();
   ASSETS.set(token, {
@@ -168,11 +130,9 @@ function registerAssets({ videoPath, musicPath }) {
   });
   return token;
 }
-
 function cleanupToken(token) {
   ASSETS.delete(token);
 }
-
 setInterval(() => {
   const now = Date.now();
   for (const [token, v] of ASSETS.entries()) {
@@ -180,7 +140,7 @@ setInterval(() => {
   }
 }, 60 * 1000);
 
-// Range support (Chromium любит range)
+// Range support
 function addRangeSupport(req, res, filePath, contentType) {
   const stat = fs.statSync(filePath);
   const fileSize = stat.size;
@@ -235,17 +195,100 @@ async function getBundle() {
   return serveUrl;
 }
 
+// -------------------- Minimal “fix for Chromium” --------------------
+// Идея: если файл уже mp4+h264+yuv420p(+aac) — НЕ трогаем.
+// Если нет — быстро перекодируем в h264/yuv420p + faststart.
+// Это убирает “Code 4” и “progress=0”.
+async function probeVideo(filePath) {
+  // выдаст JSON с потоками/форматом
+  const { out } = await run("ffprobe", [
+    "-v",
+    "error",
+    "-print_format",
+    "json",
+    "-show_format",
+    "-show_streams",
+    filePath,
+  ]);
+  return JSON.parse(out);
+}
+
+function isChromiumFriendly(info) {
+  const streams = info?.streams || [];
+  const v = streams.find((s) => s.codec_type === "video");
+  const a = streams.find((s) => s.codec_type === "audio");
+  const fmt = info?.format?.format_name || "";
+
+  // контейнер
+  const containerOk = fmt.includes("mp4") || fmt.includes("mov,mp4,m4a,3gp,3g2,mj2");
+
+  // видео кодек
+  const vCodecOk = v?.codec_name === "h264";
+  // пиксельный формат (самая частая проблема: yuv422p / yuv444p с айфона)
+  const pixOk = (v?.pix_fmt || "").includes("yuv420p");
+
+  // аудио не всегда обязателен, но если есть — лучше aac
+  const aOk = !a || a.codec_name === "aac" || a.codec_name === "mp3";
+
+  return containerOk && vCodecOk && pixOk && aOk;
+}
+
+async function ensureVideoForChromium(inputPath, jobId) {
+  if (!ENABLE_CHROMIUM_FIX) return inputPath;
+
+  let info;
+  try {
+    info = await probeVideo(inputPath);
+  } catch (e) {
+    console.log(`[job ${jobId}] ffprobe failed, will convert anyway:`, String(e?.message || e));
+  }
+
+  if (info && isChromiumFriendly(info)) {
+    console.log(`[job ${jobId}] video already chromium-friendly, skip convert`);
+    return inputPath;
+  }
+
+  const outPath = inputPath.replace(/\.[^.]+$/, "") + `-chromium.mp4`;
+
+  console.log(`[job ${jobId}] converting video for chromium -> ${path.basename(outPath)}`);
+
+  // ВАЖНО: preset veryfast — быстрее, чем “качество”
+  // movflags +faststart — чтобы mp4 нормально стримился/читался
+  // pix_fmt yuv420p — must-have для Chrome
+  await run(
+    "ffmpeg",
+    [
+      "-y",
+      "-i",
+      inputPath,
+      "-c:v",
+      "libx264",
+      "-preset",
+      "veryfast",
+      "-crf",
+      "23",
+      "-pix_fmt",
+      "yuv420p",
+      "-movflags",
+      "+faststart",
+      "-c:a",
+      "aac",
+      "-b:a",
+      "128k",
+      outPath,
+    ],
+    { timeoutMs: 10 * 60 * 1000 }
+  );
+
+  const stat = fs.statSync(outPath);
+  if (!stat.size || stat.size < 1024) throw new Error("Converted mp4 is too small");
+
+  return outPath;
+}
+
 // -------------------- JOB QUEUE (in-memory) --------------------
-/**
- * status:
- *  - queued
- *  - rendering
- *  - done
- *  - error
- */
 const JOBS = new Map(); // jobId -> job
 
-// автоочистка job’ов + файлов
 async function cleanupOldJobs() {
   const ttlMs = JOB_TTL_MIN * 60 * 1000;
   const now = Date.now();
@@ -259,8 +302,8 @@ async function cleanupOldJobs() {
       if (job.assetToken) cleanupToken(job.assetToken);
       if (job.outPath) await fsp.unlink(job.outPath).catch(() => {});
       if (job.localVideo) await fsp.unlink(job.localVideo).catch(() => {});
+      if (job.localVideoFixed) await fsp.unlink(job.localVideoFixed).catch(() => {});
       if (job.localMusic) await fsp.unlink(job.localMusic).catch(() => {});
-      if (job.chromiumVideo) await fsp.unlink(job.chromiumVideo).catch(() => {});
     } catch {}
 
     JOBS.delete(id);
@@ -284,14 +327,13 @@ async function processJob(jobId) {
 
   console.log(`[job ${jobId}] start`);
 
-  let assetToken = null;
-
   try {
     const serve = await getBundle();
 
-    // 1) download sources (как есть)
-    const localVideoRaw = path.join(os.tmpdir(), `job-${jobId}-video-raw`);
-    await downloadFromDrive(job.payload.videoFileId, localVideoRaw);
+    // 1) download sources
+    const localVideoRaw = path.join(os.tmpdir(), `job-${jobId}-video`);
+    const localVideoPath = localVideoRaw + ".bin";
+    await downloadFromDrive(job.payload.videoFileId, localVideoPath);
 
     let localMusic = null;
     if (job.payload.musicFileId) {
@@ -299,15 +341,18 @@ async function processJob(jobId) {
       await downloadFromDrive(job.payload.musicFileId, localMusic);
     }
 
-    job.localVideo = localVideoRaw;
+    job.localVideo = localVideoPath;
     job.localMusic = localMusic;
 
-    // 2) ✅ привести видео к H.264 для Chromium
-    const localVideo = await prepareVideoForChromium(localVideoRaw, jobId);
-    job.chromiumVideo = localVideo;
+    // 2) minimal chromium fix (конвертация только если нужно)
+    const localVideoFixed = await ensureVideoForChromium(localVideoPath, jobId);
+    job.localVideoFixed = localVideoFixed;
 
     // 3) register local assets and create URLs for Chromium
-    assetToken = registerAssets({ videoPath: localVideo, musicPath: localMusic });
+    const assetToken = registerAssets({
+      videoPath: localVideoFixed,
+      musicPath: localMusic,
+    });
     job.assetToken = assetToken;
 
     const baseUrl = `http://127.0.0.1:${PORT}`;
@@ -346,7 +391,7 @@ async function processJob(jobId) {
 
     const durationInFrames = Math.round(job.payload.durationSec * OUTPUT_FPS);
 
-    // 7) render with progress logs
+    // 7) render (ускоренная конфигурация)
     let lastLog = 0;
 
     await renderMedia({
@@ -361,18 +406,25 @@ async function processJob(jobId) {
       outputLocation: outPath,
       inputProps,
 
+      // Хромиум в контейнере
       chromiumOptions: {
         args: [
           "--no-sandbox",
           "--disable-setuid-sandbox",
           "--disable-dev-shm-usage",
+          "--disable-gpu",
+          "--no-zygote",
+          "--single-process",
         ],
       },
 
-      // ⚡ ускорение: Railway обычно тянет 2-4 в зависимости от CPU
-      // попробуй 3, если будет лагать — вернёшь на 2
-      concurrency: Number(process.env.RENDER_CONCURRENCY || 3),
+      // Вот тут скорость:
+      concurrency: Math.max(1, Math.min(RENDER_CONCURRENCY, os.cpus().length)),
 
+      // Кэш видео (часто сильно помогает)
+      offthreadVideoCacheSizeInBytes: OFFTHREAD_CACHE_MB * 1024 * 1024,
+
+      // таймауты
       timeoutInMilliseconds: 30 * 60 * 1000,
       delayRenderTimeoutInMilliseconds: 10 * 60 * 1000,
 
@@ -404,15 +456,12 @@ async function processJob(jobId) {
     job.progress = 1;
     job.updatedAtIso = nowIso();
 
-    console.log(
-      `[job ${jobId}] done in ${Math.round((job.finishedAt - job.startedAt) / 1000)}s`
-    );
+    console.log(`[job ${jobId}] done in ${Math.round((job.finishedAt - job.startedAt) / 1000)}s`);
   } catch (e) {
     job.status = "error";
     job.error = String(e?.message || e);
     job.finishedAt = Date.now();
     job.updatedAtIso = nowIso();
-
     console.log(`[job ${jobId}] ERROR:`, job.error);
   }
 }
@@ -420,9 +469,6 @@ async function processJob(jobId) {
 // -------------------- Routes --------------------
 app.get("/health", (_, res) => res.json({ ok: true }));
 
-/**
- * POST /render
- */
 app.post("/render", (req, res) => {
   try {
     const body = req.body || {};
@@ -475,7 +521,7 @@ app.post("/render", (req, res) => {
       finishedAt: null,
       outPath: null,
       localVideo: null,
-      chromiumVideo: null,
+      localVideoFixed: null,
       localMusic: null,
       assetToken: null,
     });
@@ -517,14 +563,12 @@ app.get("/download/:jobId", (req, res) => {
 
   res.setHeader("Content-Type", "video/mp4");
   res.setHeader("Content-Disposition", `attachment; filename="short-${job.id}.mp4"`);
-
   fs.createReadStream(job.outPath).pipe(res);
 });
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`Remotion renderer async running on ${PORT}`);
   console.log(`COMPOSITION_ID=${COMPOSITION_ID}, OUTPUT_FPS=${OUTPUT_FPS}`);
-  console.log(`JOB_TTL_MIN=${JOB_TTL_MIN}, CLEANUP_EVERY_SEC=${JOB_CLEANUP_EVERY_SEC}`);
-  console.log(`FFMPEG_PRESET=${FFMPEG_PRESET}, FFMPEG_CRF=${FFMPEG_CRF}`);
-  console.log(`RENDER_CONCURRENCY=${process.env.RENDER_CONCURRENCY || 3}`);
+  console.log(`RENDER_CONCURRENCY=${RENDER_CONCURRENCY}, OFFTHREAD_CACHE_MB=${OFFTHREAD_CACHE_MB}`);
+  console.log(`ENABLE_CHROMIUM_FIX=${ENABLE_CHROMIUM_FIX}`);
 });
