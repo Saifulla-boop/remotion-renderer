@@ -10,5 +10,6 @@
     "@remotion/renderer": "^4.0.0",
     "express": "^4.19.2",
     "googleapis": "^144.0.0"
+    "googleapis": "^140.0.0"
   }
 }
