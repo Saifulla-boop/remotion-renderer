@@ -97,7 +97,7 @@ app.get("/asset/:token/music", (req, res) => {
   fs.createReadStream(entry.musicPath).pipe(res);
 });
 
-// -------------------- ffprobe helpers (orientation) --------------------
+// -------------------- ffmpeg/ffprobe helpers --------------------
 function run(cmd, args, { timeoutMs = 25000 } = {}) {
   return new Promise((resolve, reject) => {
     const p = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"] });
@@ -139,6 +139,50 @@ async function getVideoDims(filePath) {
   return { w, h };
 }
 
+// ✅ ВАЖНО: перекод в H.264 MP4 (Chromium на Linux стабильно это ест)
+async function transcodeToH264Mp4(inPath, outPath) {
+  // 10 минут на перекод (на случай больших файлов)
+  await run(
+    "ffmpeg",
+    [
+      "-y",
+      "-i",
+      inPath,
+      "-c:v",
+      "libx264",
+      "-pix_fmt",
+      "yuv420p",
+      "-preset",
+      "veryfast",
+      "-crf",
+      "20",
+      "-movflags",
+      "+faststart",
+      "-c:a",
+      "aac",
+      "-b:a",
+      "192k",
+      outPath,
+    ],
+    { timeoutMs: 10 * 60 * 1000 }
+  );
+
+  const stat = fs.statSync(outPath);
+  if (!stat.size || stat.size < 1024) {
+    throw new Error(`Transcoded file too small (${stat.size}).`);
+  }
+
+  return outPath;
+}
+
+async function ensurePlayableVideo(inputPath) {
+  // Самый надёжный режим: всегда перегоняем в H.264 MP4
+  // (потому что MOV/HEVC валит Chromium => delayRender timeout)
+  const outPath = path.join(os.tmpdir(), `playable-${Date.now()}.mp4`);
+  await transcodeToH264Mp4(inputPath, outPath);
+  return outPath;
+}
+
 // -------------------- Remotion bundle cache --------------------
 let serveUrl = null;
 
@@ -154,7 +198,8 @@ async function getBundle() {
 app.get("/health", (_, res) => res.json({ ok: true }));
 
 app.post("/render", async (req, res) => {
-  let localVideo = null;
+  let localVideo = null;      // исходник с диска
+  let playableVideo = null;   // перекодированный mp4
   let localMusic = null;
   let outPath = null;
   let token = null;
@@ -182,7 +227,8 @@ app.post("/render", async (req, res) => {
     const serve = await getBundle();
 
     // 1) download sources to /tmp
-    localVideo = path.join(os.tmpdir(), `in-video-${Date.now()}.mp4`);
+    //    (НЕ привязываемся к расширению — с Drive может прилететь MOV)
+    localVideo = path.join(os.tmpdir(), `in-video-${Date.now()}`);
     await downloadFromDrive(videoFileId, localVideo);
 
     if (musicFileId) {
@@ -190,15 +236,21 @@ app.post("/render", async (req, res) => {
       await downloadFromDrive(musicFileId, localMusic);
     }
 
-    // 2) detect orientation
-    const { w, h } = await getVideoDims(localVideo);
+    // 2) ✅ делаем видео гарантированно декодируемым (H.264 MP4)
+    playableVideo = await ensurePlayableVideo(localVideo);
+    // исходник больше не нужен
+    await fsp.unlink(localVideo).catch(() => {});
+    localVideo = null;
+
+    // 3) detect orientation уже по playable mp4
+    const { w, h } = await getVideoDims(playableVideo);
     const isHorizontal = w > h;
     const fitMode = isHorizontal ? "contain" : "cover";
 
     console.log("VIDEO_DIMS:", { w, h, isHorizontal, fitMode });
 
-    // 3) serve local assets via HTTP
-    token = registerAssets({ videoPath: localVideo, musicPath: localMusic });
+    // 4) serve local assets via HTTP
+    token = registerAssets({ videoPath: playableVideo, musicPath: localMusic });
 
     const baseUrl = `http://127.0.0.1:${PORT}`;
     const videoUrl = `${baseUrl}/asset/${token}/video`;
@@ -253,7 +305,7 @@ app.post("/render", async (req, res) => {
       try {
         if (token) cleanupToken(token);
         if (outPath) await fsp.unlink(outPath).catch(() => {});
-        if (localVideo) await fsp.unlink(localVideo).catch(() => {});
+        if (playableVideo) await fsp.unlink(playableVideo).catch(() => {});
         if (localMusic) await fsp.unlink(localMusic).catch(() => {});
       } catch {}
     });
@@ -265,6 +317,7 @@ app.post("/render", async (req, res) => {
       if (token) cleanupToken(token);
       if (outPath) await fsp.unlink(outPath).catch(() => {});
       if (localVideo) await fsp.unlink(localVideo).catch(() => {});
+      if (playableVideo) await fsp.unlink(playableVideo).catch(() => {});
       if (localMusic) await fsp.unlink(localMusic).catch(() => {});
     } catch {}
   }
