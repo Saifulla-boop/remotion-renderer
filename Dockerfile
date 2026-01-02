@@ -10,6 +10,8 @@ RUN apt-get update && apt-get install -y \
   libgbm1 libasound2 libpangocairo-1.0-0 libgtk-3-0 \
   && rm -rf /var/lib/apt/lists/*
 
+  RUN apt-get update && apt-get install -y ffmpeg && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 
 COPY package.json /app/package.json
