@@ -7,33 +7,21 @@ type Props = {
   durationSec?: number;
   fitMode?: "cover" | "contain";
 
-  // поддержка всех вариантов
-  videoPath?: string;
-  musicPath?: string;
-
   videoUrl?: string;
-  musicUrl?: string;
-
+  videoPath?: string;
   videoSrc?: string;
+
+  musicUrl?: string;
+  musicPath?: string;
   musicSrc?: string;
 };
 
 export const Short: React.FC<Props> = (props) => {
-  const {
-    hook,
-    fitMode = "cover",
-  } = props;
+  const video = props.videoUrl || props.videoPath || props.videoSrc || "";
+  const music = props.musicUrl || props.musicPath || props.musicSrc || "";
+  const fitMode = props.fitMode || "cover";
 
-  // ✅ выбираем первый непустой вариант
-  const video =
-    props.videoPath || props.videoUrl || props.videoSrc || "";
-
-  const music =
-    props.musicPath || props.musicUrl || props.musicSrc || "";
-
-  if (!video) {
-    throw new Error("No src passed (video is empty). Expected videoPath/videoUrl/videoSrc");
-  }
+  if (!video) throw new Error("No src passed (video is empty)");
 
   return (
     <AbsoluteFill style={{ backgroundColor: "black" }}>
@@ -76,7 +64,7 @@ export const Short: React.FC<Props> = (props) => {
                 "Inter, -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, Arial, sans-serif",
             }}
           >
-            {hook}
+            {props.hook}
           </div>
         </div>
       </AbsoluteFill>
