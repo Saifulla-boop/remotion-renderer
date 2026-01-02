@@ -1,47 +1,73 @@
-import { AbsoluteFill, Audio, Video, useVideoConfig } from "remotion";
+import { AbsoluteFill, Video, Audio } from "remotion";
 
-export const Short: React.FC<{
-  hook: string;
+type Props = {
+  hook?: string;
   description?: string;
-  videoSrc: string;
+  durationSec?: number;
+
+  // поддерживаем все варианты
+  videoUrl?: string;
+  videoPath?: string;
+  videoSrc?: string;
+
+  musicUrl?: string;
+  musicPath?: string;
   musicSrc?: string;
-}> = ({ hook, description, videoSrc, musicSrc }) => {
-  const { width, height } = useVideoConfig();
+};
+
+export const Short: React.FC<Props> = (props) => {
+  const {
+    hook = "",
+    description = "",
+  } = props;
+
+  // 🔥 выбираем первый валидный src
+  const videoSrc =
+    props.videoSrc ??
+    props.videoUrl ??
+    props.videoPath;
+
+  const musicSrc =
+    props.musicSrc ??
+    props.musicUrl ??
+    props.musicPath;
+
+  if (!videoSrc) {
+    throw new Error(
+      "Short.tsx: video src is undefined. Check server inputProps."
+    );
+  }
 
   return (
     <AbsoluteFill style={{ backgroundColor: "black" }}>
-      {/* ВИДЕО — БЕЗ SCALE */}
+      {/* ВИДЕО — БЕЗ трансформаций */}
       <Video
         src={videoSrc}
         startFrom={0}
-        style={{
-          width,
-          height,
-        }}
+        endAt={undefined}
       />
 
-      {/* МУЗЫКА */}
-      {musicSrc && <Audio src={musicSrc} volume={0.8} />}
+      {/* МУЗЫКА — опционально */}
+      {musicSrc ? <Audio src={musicSrc} /> : null}
 
       {/* ТЕКСТ */}
       <AbsoluteFill
         style={{
-          justifyContent: "flex-end",
+          justifyContent: "center",
           alignItems: "center",
-          paddingBottom: 120,
-          pointerEvents: "none",
+          padding: 40,
+          textAlign: "center",
         }}
       >
         <div
           style={{
-            background: "rgba(0,0,0,0.55)",
+            background: "rgba(0,0,0,0.6)",
             color: "white",
             padding: "24px 32px",
-            borderRadius: 24,
-            fontSize: 42,
-            maxWidth: "90%",
-            textAlign: "center",
+            borderRadius: 16,
+            fontSize: 48,
             lineHeight: 1.2,
+            maxWidth: "90%",
           }}
         >
           {hook}
