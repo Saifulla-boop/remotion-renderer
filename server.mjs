@@ -13,9 +13,14 @@ import { google } from "googleapis";
 const app = express();
 app.use(express.json({ limit: "10mb" }));
 
-const PORT = Number(process.env.PORT || 3000);
+const PORT = process.env.PORT || 3000;
 
-// ===================== Google Drive (Service Account, READONLY) =====================
+// ====== FPS CONFIG (айфон 60fps) ======
+const TARGET_FPS = 60;             // делаем 60, чтобы было максимально плавно
+const MIN_SEC = 6;
+const MAX_SEC = 30;
+
+// -------------------- Google Drive (Service Account, READONLY) --------------------
 function getDrive() {
   const email = process.env.GOOGLE_CLIENT_EMAIL;
   const keyRaw = process.env.GOOGLE_PRIVATE_KEY;
@@ -56,9 +61,8 @@ async function downloadFromDrive(fileId, outPath) {
   return outPath;
 }
 
-// ===================== Local assets served via HTTP (Chromium reads these) =====================
-// token -> { videoPath, musicPath?, expiresAt }
-const ASSETS = new Map();
+// -------------------- Local assets served via HTTP (for Remotion/Chromium) --------------------
+const ASSETS = new Map(); // token -> { videoPath, musicPath?, expiresAt }
 
 function createToken() {
   return crypto.randomBytes(16).toString("hex");
@@ -69,7 +73,7 @@ function registerAssets({ videoPath, musicPath }) {
   ASSETS.set(token, {
     videoPath,
     musicPath,
-    expiresAt: Date.now() + 15 * 60 * 1000, // 15 минут
+    expiresAt: Date.now() + 15 * 60 * 1000,
   });
   return token;
 }
@@ -78,7 +82,6 @@ function cleanupToken(token) {
   ASSETS.delete(token);
 }
 
-// периодическая уборка
 setInterval(() => {
   const now = Date.now();
   for (const [token, v] of ASSETS.entries()) {
@@ -86,58 +89,22 @@ setInterval(() => {
   }
 }, 2 * 60 * 1000);
 
-// -------------------- IMPORTANT: Range support (fixes delayRender timeout) --------------------
-function streamWithRange(req, res, filePath, contentType) {
-  const stat = fs.statSync(filePath);
-  const fileSize = stat.size;
-
-  res.setHeader("Accept-Ranges", "bytes");
-  res.setHeader("Content-Type", contentType);
-
-  const range = req.headers.range;
-
-  // если браузер НЕ запросил range — отдаем целиком
-  if (!range) {
-    res.setHeader("Content-Length", fileSize);
-    return fs.createReadStream(filePath).pipe(res);
-  }
-
-  const match = /bytes=(\d+)-(\d*)/.exec(range);
-  if (!match) {
-    return res.status(416).send("Malformed Range header");
-  }
-
-  const start = parseInt(match[1], 10);
-  const end = match[2] ? parseInt(match[2], 10) : fileSize - 1;
-
-  if (start >= fileSize || end >= fileSize) {
-    res.setHeader("Content-Range", `bytes */${fileSize}`);
-    return res.status(416).end();
-  }
-
-  const chunkSize = end - start + 1;
-
-  res.status(206);
-  res.setHeader("Content-Range", `bytes ${start}-${end}/${fileSize}`);
-  res.setHeader("Content-Length", chunkSize);
-
-  return fs.createReadStream(filePath, { start, end }).pipe(res);
-}
-
 app.get("/asset/:token/video", (req, res) => {
   const entry = ASSETS.get(req.params.token);
   if (!entry?.videoPath) return res.status(404).send("Not found");
-  return streamWithRange(req, res, entry.videoPath, "video/mp4");
+  res.setHeader("Content-Type", "video/mp4");
+  fs.createReadStream(entry.videoPath).pipe(res);
 });
 
 app.get("/asset/:token/music", (req, res) => {
   const entry = ASSETS.get(req.params.token);
   if (!entry?.musicPath) return res.status(404).send("Not found");
-  return streamWithRange(req, res, entry.musicPath, "audio/mpeg");
+  res.setHeader("Content-Type", "audio/mpeg");
+  fs.createReadStream(entry.musicPath).pipe(res);
 });
 
-// ===================== ffprobe helpers (orientation) =====================
-function run(cmd, args, { timeoutMs = 25000 } = {}) {
+// -------------------- helpers: run ffmpeg/ffprobe --------------------
+function run(cmd, args, { timeoutMs = 120000 } = {}) {
   return new Promise((resolve, reject) => {
     const p = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"] });
 
@@ -178,91 +145,168 @@ async function getVideoDims(filePath) {
   return { w, h };
 }
 
-// ===================== Remotion bundle cache =====================
+// ✅ Нормализация айфон-видео (VFR -> CFR), + приводим к H.264/yuv420p
+async function normalizeVideoToCfr(inputPath, fps = TARGET_FPS) {
+  const outPath = path.join(os.tmpdir(), `cfr-${Date.now()}.mp4`);
+
+  await run(
+    "ffmpeg",
+    [
+      "-y",
+      "-i",
+      inputPath,
+
+      // делаем ровные кадры
+      "-vf",
+      `fps=${fps}`,
+      "-r",
+      String(fps),
+
+      // кодек для стабильного декода в Chromium
+      "-c:v",
+      "libx264",
+      "-preset",
+      "veryfast",
+      "-crf",
+      "18",
+      "-pix_fmt",
+      "yuv420p",
+      "-movflags",
+      "+faststart",
+
+      // звук выкидываем — у тебя отдельная музыка
+      "-an",
+      outPath,
+    ],
+    { timeoutMs: 180000 }
+  );
+
+  const stat = fs.statSync(outPath);
+  if (!stat.size || stat.size < 1024) {
+    throw new Error(`normalizeVideoToCfr produced too small file (${stat.size})`);
+  }
+
+  return outPath;
+}
+
+// (опционально) финализация рендера — если захочешь сделать идеально “инстаграмно”
+// сейчас НЕ используем, потому что рендерим сразу 60fps
+async function finalizeOutputSmooth(inputPath, fps = TARGET_FPS) {
+  const outPath = path.join(os.tmpdir(), `final-${Date.now()}.mp4`);
+
+  await run(
+    "ffmpeg",
+    [
+      "-y",
+      "-i",
+      inputPath,
+      "-vf",
+      `fps=${fps}`,
+      "-r",
+      String(fps),
+      "-c:v",
+      "libx264",
+      "-preset",
+      "slow",
+      "-crf",
+      "18",
+      "-pix_fmt",
+      "yuv420p",
+      "-movflags",
+      "+faststart",
+      "-c:a",
+      "aac",
+      "-b:a",
+      "192k",
+      outPath,
+    ],
+    { timeoutMs: 240000 }
+  );
+
+  return outPath;
+}
+
+// -------------------- Remotion bundle cache --------------------
 let serveUrl = null;
 
 async function getBundle() {
   if (serveUrl) return serveUrl;
-
-  // важно: в docker/railway process.cwd() == /app, remotion лежит /app/remotion/...
   serveUrl = await bundle({
     entryPoint: path.join(process.cwd(), "remotion", "src", "index.ts"),
   });
-
-  console.log("[remotion] bundle ready:", serveUrl);
   return serveUrl;
 }
 
-// ===================== Routes =====================
+// -------------------- Routes --------------------
 app.get("/health", (_, res) => res.json({ ok: true }));
 
 app.post("/render", async (req, res) => {
   let localVideo = null;
   let localMusic = null;
+  let normalizedVideo = null;
   let outPath = null;
   let token = null;
 
   try {
     const body = req.body || {};
 
-    // входные поля (поддержка разных имен)
+    // вход
     const hook = String(body.hook ?? "");
     const description = String(body.description ?? "");
-    const durationSec = body.durationSec;
 
+    const durationSecRaw = body.durationSec;
+    const durationSec = Number.isFinite(Number(durationSecRaw))
+      ? Math.min(Math.max(Number(durationSecRaw), MIN_SEC), MAX_SEC)
+      : 12;
+
+    // поддержка разных имён полей
     const videoFileId =
       body.videoFileId ?? body.videoFieldId ?? body.videoFileid ?? body.videoFieldid;
-
     const musicFileId =
       body.musicFileId ?? body.musicFieldId ?? body.musicFileid ?? body.musicFieldid;
 
-    if (!videoFileId) {
-      return res.status(400).json({ error: "videoFileId required" });
-    }
-
-    const duration = Number.isFinite(Number(durationSec))
-      ? Math.min(Math.max(Number(durationSec), 6), 30)
-      : 12;
+    if (!videoFileId) return res.status(400).json({ error: "videoFileId required" });
 
     const serve = await getBundle();
 
-    // 1) download sources to /tmp
+    // 1) download sources
     localVideo = path.join(os.tmpdir(), `in-video-${Date.now()}.mp4`);
-    await downloadFromDrive(String(videoFileId), localVideo);
+    await downloadFromDrive(videoFileId, localVideo);
 
     if (musicFileId) {
       localMusic = path.join(os.tmpdir(), `in-music-${Date.now()}.mp3`);
-      await downloadFromDrive(String(musicFileId), localMusic);
+      await downloadFromDrive(musicFileId, localMusic);
     }
 
-    // 2) detect orientation -> fitMode
-    const { w, h } = await getVideoDims(localVideo);
+    // 2) нормализуем видео (айфон VFR -> CFR 60fps) ✅
+    normalizedVideo = await normalizeVideoToCfr(localVideo, TARGET_FPS);
+
+    // 3) orientation -> fitMode
+    const { w, h } = await getVideoDims(normalizedVideo);
     const isHorizontal = w > h;
     const fitMode = isHorizontal ? "contain" : "cover";
 
-    console.log("[render] VIDEO_DIMS:", { w, h, isHorizontal, fitMode });
+    console.log("VIDEO_DIMS:", { w, h, isHorizontal, fitMode, fps: TARGET_FPS });
 
-    // 3) serve local assets via HTTP (Chromium MUST access by URL)
-    token = registerAssets({ videoPath: localVideo, musicPath: localMusic });
+    // 4) раздаём локальные ассеты (Chromium должен брать по HTTP)
+    token = registerAssets({ videoPath: normalizedVideo, musicPath: localMusic });
 
-    // ВАЖНО: Chromium, который запускает Remotion, находится в этом же контейнере.
-    // Поэтому 127.0.0.1:PORT – правильно.
+    // Внутри контейнера Chromium стучится в этот же сервис — 127.0.0.1 работает
     const baseUrl = `http://127.0.0.1:${PORT}`;
     const videoUrl = `${baseUrl}/asset/${token}/video`;
     const musicUrl = localMusic ? `${baseUrl}/asset/${token}/music` : "";
 
-    // 4) inputProps: пробрасываем все варианты названий
+    // 5) ВАЖНО: отдаём ВСЕ варианты названий, чтобы Short не ломался при смене полей
     const inputProps = {
       hook,
       description,
-      durationSec: duration,
+      durationSec,
       fitMode,
 
-      // исторические имена
+      // варианты под разные Short.tsx
       videoUrl,
       musicUrl,
 
-      // новые/альтернативные
       videoPath: videoUrl,
       musicPath: musicUrl,
 
@@ -270,7 +314,6 @@ app.post("/render", async (req, res) => {
       musicSrc: musicUrl,
     };
 
-    // selectComposition берёт актуальную длительность/props
     const composition = await selectComposition({
       serveUrl: serve,
       id: "Short",
@@ -282,40 +325,45 @@ app.post("/render", async (req, res) => {
     await renderMedia({
       composition: {
         ...composition,
-        fps: 30,
-        durationInFrames: Math.round(duration * 30),
+        fps: TARGET_FPS,
+        durationInFrames: Math.round(durationSec * TARGET_FPS),
       },
       serveUrl: serve,
       codec: "h264",
       outputLocation: outPath,
       inputProps,
-      timeoutInMilliseconds: 180000, // 3 минуты (страховка)
+
+      // чтобы не падало на медленном старте видео
+      timeoutInMilliseconds: 240000,
     });
+
+    // Если захочешь финализировать (обычно не надо, но можно):
+    // outPath = await finalizeOutputSmooth(outPath, TARGET_FPS);
 
     res.setHeader("Content-Type", "video/mp4");
     res.setHeader("Content-Disposition", `attachment; filename="short.mp4"`);
 
-    fs.createReadStream(outPath).pipe(res);
+    const stream = fs.createReadStream(outPath);
+    stream.pipe(res);
 
-    res.on("close", async () => {
+    stream.on("close", async () => {
       try {
         if (token) cleanupToken(token);
         if (outPath) await fsp.unlink(outPath).catch(() => {});
         if (localVideo) await fsp.unlink(localVideo).catch(() => {});
+        if (normalizedVideo) await fsp.unlink(normalizedVideo).catch(() => {});
         if (localMusic) await fsp.unlink(localMusic).catch(() => {});
       } catch {}
     });
   } catch (e) {
-    console.error("[render] ERROR:", e);
-
-    if (!res.headersSent) {
-      res.status(500).json({ error: e?.message || "Render failed" });
-    }
+    console.error(e);
+    if (!res.headersSent) res.status(500).json({ error: e?.message || "Render failed" });
 
     try {
       if (token) cleanupToken(token);
       if (outPath) await fsp.unlink(outPath).catch(() => {});
       if (localVideo) await fsp.unlink(localVideo).catch(() => {});
+      if (normalizedVideo) await fsp.unlink(normalizedVideo).catch(() => {});
       if (localMusic) await fsp.unlink(localMusic).catch(() => {});
     } catch {}
   }
