@@ -1,4 +1,4 @@
-import { AbsoluteFill, useVideoConfig, OffthreadVideo } from "remotion";
+import { AbsoluteFill, Video, useVideoConfig } from "remotion";
 
 type Props = {
   videoSrc?: string;
@@ -8,21 +8,18 @@ type Props = {
 
 export const Short: React.FC<Props> = (props) => {
   const { width, height } = useVideoConfig();
-
   const src = props.videoSrc ?? props.videoUrl ?? props.videoPath;
 
-  if (!src) {
-    throw new Error("Short.tsx: video source is missing");
-  }
+  if (!src) throw new Error("Missing video src");
 
   return (
     <AbsoluteFill style={{ backgroundColor: "black" }}>
-      <OffthreadVideo
+      <Video
         src={src}
         style={{
           width,
           height,
-          objectFit: "contain",
+          objectFit: "contain", // без растяжения
         }}
       />
     </AbsoluteFill>
