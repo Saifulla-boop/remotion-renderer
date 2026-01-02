@@ -2,36 +2,47 @@ import express from "express";
 import fs from "fs";
 import path from "path";
 import os from "os";
+import fetch from "node-fetch"; // если у тебя реально установлен node-fetch - ок. Если нет, скажи, дам версию без него.
 import { fileURLToPath } from "url";
+import { Readable } from "stream";
 
-import { getCompositions, renderMedia } from "@remotion/renderer";
-import { bundle } from "@remotion/bundler";
+import { bundle, getCompositions, renderMedia } from "@remotion/renderer";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
-
-// Можно увеличить лимит, чтобы длинные описания не резало
-app.use(express.json({ limit: "10mb" }));
+app.use(express.json({ limit: "2mb" }));
 
 /**
  * ============ CONFIG ============
+ * 1) Путь к Remotion проекту
  */
 const REMOTION_ROOT = path.join(__dirname, "remotion");
 const REMOTION_ENTRY = path.join(REMOTION_ROOT, "src", "index.ts");
+
+/**
+ * 2) Название композиции (compositionId) в Remotion
+ */
 const COMPOSITION_ID = process.env.COMPOSITION_ID || "Short";
 
 /**
- * Google Drive download URL
+ * 3) Google Drive
  */
 const driveDownloadUrl = (fileId) =>
-  `https://drive.google.com/uc?export=download&id=${encodeURIComponent(fileId)}`;
+  `https://drive.google.com/uc?export=download&id=${encodeURIComponent(
+    fileId
+  )}`;
 
+/**
+ * Чистим случайные символы типа "=" в fileId
+ */
 const cleanId = (s) => String(s || "").replace(/^=+/, "").trim();
 
 /**
- * Download file to tmp
+ * Скачиваем файл во временную папку
+ * Node 18: fetch возвращает Web ReadableStream -> его нельзя pipe() напрямую.
+ * Конвертим через Readable.fromWeb().
  */
 async function downloadToTmp({ fileId, ext }) {
   const safeId = cleanId(fileId);
@@ -39,100 +50,91 @@ async function downloadToTmp({ fileId, ext }) {
 
   const url = driveDownloadUrl(safeId);
 
-  // Node 18+ имеет глобальный fetch
   const res = await fetch(url, { redirect: "follow" });
-  if (!res.ok) throw new Error(`Drive download failed (${res.status}): ${url}`);
+  if (!res.ok) {
+    throw new Error(`Drive download failed (${res.status}): ${url}`);
+  }
+  if (!res.body) {
+    throw new Error("Drive download failed: response has no body");
+  }
 
   const tmpPath = path.join(os.tmpdir(), `${Date.now()}-${safeId}.${ext}`);
   const fileStream = fs.createWriteStream(tmpPath);
 
+  // ВАЖНО: Node 18 fetch -> WebStream, конвертим в Node stream
+  const nodeStream = Readable.fromWeb(res.body);
+
   await new Promise((resolve, reject) => {
-    res.body.pipe(fileStream);
-    res.body.on("error", reject);
+    nodeStream.pipe(fileStream);
+    nodeStream.on("error", reject);
+    fileStream.on("error", reject);
     fileStream.on("finish", resolve);
   });
 
+  // минимальная проверка размера
   const stat = fs.statSync(tmpPath);
   if (!stat.size || stat.size < 1024) {
     throw new Error(
-      `Downloaded file looks wrong (size=${stat.size}). Drive returned HTML/not-file. fileId=${safeId}`
+      `Downloaded file looks wrong (size=${stat.size}). Probably Drive returned an HTML page (not a file). fileId=${safeId}`
     );
   }
 
   return tmpPath;
 }
 
-/**
- * ========= Remotion lazy init =========
- * Не блокируем старт сервера. Railway должен увидеть открытый порт сразу.
- */
 let bundleLocation = null;
 let compositionsCache = null;
-let initPromise = null;
 
-async function ensureRemotionReady() {
-  if (bundleLocation && compositionsCache) return;
+/**
+ * Бандлим Remotion один раз при старте
+ */
+async function prepareRemotion() {
+  console.log("[remotion] bundling...");
+  bundleLocation = await bundle({
+    entryPoint: REMOTION_ENTRY,
+    webpackOverride: (config) => config,
+  });
+  console.log("[remotion] bundle ready:", bundleLocation);
 
-  if (!initPromise) {
-    initPromise = (async () => {
-      console.log("[remotion] bundling...");
-      bundleLocation = await bundle({
-        entryPoint: REMOTION_ENTRY,
-        webpackOverride: (config) => config,
-      });
-
-      console.log("[remotion] bundle ready:", bundleLocation);
-
-      compositionsCache = await getCompositions(bundleLocation, {
-        inputProps: {},
-      });
-
-      console.log(
-        "[remotion] compositions:",
-        compositionsCache.map((c) => c.id)
-      );
-    })().catch((e) => {
-      // если инициализация упала — обнуляем, чтобы можно было попробовать снова
-      initPromise = null;
-      throw e;
-    });
-  }
-
-  await initPromise;
+  compositionsCache = await getCompositions(bundleLocation, {
+    inputProps: {},
+  });
+  console.log(
+    "[remotion] compositions:",
+    compositionsCache.map((c) => c.id)
+  );
 }
 
-/**
- * Health
- */
 app.get("/health", (req, res) => {
-  res.json({ ok: true, status: "alive" });
-});
-
-app.get("/render", (req, res) => {
-  res
-    .status(200)
-    .send("OK. Use POST /render with JSON body: {hook, description, videoFileId, musicFileId, durationSec}");
+  res.json({ ok: true });
 });
 
 /**
- * Render endpoint
+ * Рендер
  */
 app.post("/render", async (req, res) => {
-  let outPath = null;
-  let videoPath = null;
-  let musicPath = null;
-
   try {
-    const { hook, description, videoFileId, musicFileId, durationSec } = req.body || {};
+    const { hook, description, videoFileId, musicFileId, durationSec } =
+      req.body || {};
 
-    // ---- Валидация
-    if (!hook || typeof hook !== "string") throw new Error("hook is missing (string required)");
-    if (typeof description !== "string") throw new Error("description is missing (string required)");
-    if (!videoFileId || typeof videoFileId !== "string") throw new Error("videoFileId is missing (string required)");
-    if (!musicFileId || typeof musicFileId !== "string") throw new Error("musicFileId is missing (string required)");
+    // ---- Жёсткая валидация (чтобы не было "src undefined")
+    if (!hook || typeof hook !== "string") {
+      throw new Error("hook is missing (string required)");
+    }
+    if (typeof description !== "string") {
+      throw new Error("description is missing (string required)");
+    }
+    if (!videoFileId || typeof videoFileId !== "string") {
+      throw new Error("videoFileId is missing (string required)");
+    }
+    if (!musicFileId || typeof musicFileId !== "string") {
+      throw new Error("musicFileId is missing (string required)");
+    }
 
     const dur = Number(durationSec ?? 12);
-    if (!Number.isFinite(dur) || dur <= 0) throw new Error("durationSec must be a positive number");
+    if (!Number.isFinite(dur) || dur <= 0) {
+      throw new Error("durationSec must be a positive number");
+    }
 
     console.log("[render] input:", {
       hook,
@@ -142,24 +144,35 @@ app.post("/render", async (req, res) => {
       durationSec: dur,
     });
 
-    // ---- Remotion init (лениво)
-    await ensureRemotionReady();
-
     // ---- Скачиваем исходники
-    videoPath = await downloadToTmp({ fileId: videoFileId, ext: "mp4" });
-    musicPath = await downloadToTmp({ fileId: musicFileId, ext: "mp3" });
+    const videoPath = await downloadToTmp({ fileId: videoFileId, ext: "mp4" });
+    const musicPath = await downloadToTmp({ fileId: musicFileId, ext: "mp3" });
 
-    // ---- Композиция
-    const comps = compositionsCache || (await getCompositions(bundleLocation, { inputProps: {} }));
+    if (!videoPath || typeof videoPath !== "string") {
+      throw new Error("videoPath is missing after download");
+    }
+    if (!musicPath || typeof musicPath !== "string") {
+      throw new Error("musicPath is missing after download");
+    }
+
+    // ---- Ищем композицию
+    const comps =
+      compositionsCache ||
+      (await getCompositions(bundleLocation, { inputProps: {} }));
+
     const comp = comps.find((c) => c.id === COMPOSITION_ID);
+
     if (!comp) {
       throw new Error(
-        `Composition "${COMPOSITION_ID}" not found. Available: ${comps.map((c) => c.id).join(", ")}`
+        `Composition "${COMPOSITION_ID}" not found. Available: ${comps
+          .map((c) => c.id)
+          .join(", ")}`
       );
     }
 
-    outPath = path.join(os.tmpdir(), `render-${Date.now()}.mp4`);
+    const outPath = path.join(os.tmpdir(), `render-${Date.now()}.mp4`);
 
+    // ---- inputProps, которые должны использоваться в Short.tsx
     const inputProps = {
       hook,
       description,
@@ -168,9 +181,12 @@ app.post("/render", async (req, res) => {
       musicPath,
     };
 
-    console.log("[render] start renderMedia...", {
-      comp: comp.id,
+    console.log("[render] inputProps:", {
+      hook: inputProps.hook,
+      descriptionLen: inputProps.description.length,
       durationSec: inputProps.durationSec,
+      videoPath: inputProps.videoPath,
+      musicPath: inputProps.musicPath,
     });
 
     await renderMedia({
@@ -178,44 +194,50 @@ app.post("/render", async (req, res) => {
       serveUrl: bundleLocation,
       codec: "h264",
       outputLocation: outPath,
+    //  inputProps MUST be passed:
       inputProps,
-      // Можно ускорять/качество:
       // crf: 18,
       // preset: "medium",
     });
 
-    // ---- Отдаём mp4
+    // ---- Отдаём файл бинарём
     res.setHeader("Content-Type", "video/mp4");
     res.setHeader("Content-Disposition", `attachment; filename="short.mp4"`);
 
     const stream = fs.createReadStream(outPath);
     stream.pipe(res);
 
-    // чистка по закрытию соединения/окончанию
-    res.on("close", () => {
-      try { if (outPath) fs.unlinkSync(outPath); } catch {}
-      try { if (videoPath) fs.unlinkSync(videoPath); } catch {}
-      try { if (musicPath) fs.unlinkSync(musicPath); } catch {}
+    stream.on("close", () => {
+      // чистим мусор
+      try {
+        fs.unlinkSync(outPath);
+      } catch {}
+      try {
+        fs.unlinkSync(videoPath);
+      } catch {}
+      try {
+        fs.unlinkSync(musicPath);
+      } catch {}
     });
   } catch (e) {
     console.error("[render] error:", e);
-    res.status(400).json({ ok: false, error: String(e?.message || e) });
-
-    // чистим мусор и при ошибке
-    try { if (outPath) fs.unlinkSync(outPath); } catch {}
-    try { if (videoPath) fs.unlinkSync(videoPath); } catch {}
-    try { if (musicPath) fs.unlinkSync(musicPath); } catch {}
+    res.status(400).json({
+      ok: false,
+      error: String(e?.message || e),
+    });
   }
 });
 
-/**
- * START: важно для Railway
- */
+// старт
 const port = process.env.PORT || 3000;
 
-// Сразу открываем порт → Railway видит сервис живым
-app.listen(port, "0.0.0.0", () => {
-  console.log(`Server listening on ${port}`);
-  // можно прогреть remotion на фоне (не обязательно)
-  // ensureRemotionReady().catch((e) => console.error("[remotion] warmup failed:", e));
-});
+prepareRemotion()
+  .then(() => {
+    app.listen(port, () => {
+      console.log(`Server listening on :${port}`);
+    });
+  })
+  .catch((e) => {
+    console.error("Failed to start Remotion server:", e);
+    process.exit(1);
+  });
