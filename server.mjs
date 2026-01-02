@@ -15,8 +15,9 @@ app.use(express.json({ limit: "10mb" }));
 
 const PORT = process.env.PORT || 3000;
 
-// ====== FPS CONFIG (айфон 60fps) ======
-const TARGET_FPS = 60;             // делаем 60, чтобы было максимально плавно
+// ===== FPS =====
+// По умолчанию 30 (быстрее и стабильнее на Railway). Для 60: OUTPUT_FPS=60
+const OUTPUT_FPS = Number(process.env.OUTPUT_FPS || 30);
 const MIN_SEC = 6;
 const MAX_SEC = 30;
 
@@ -42,7 +43,6 @@ function getDrive() {
 
 async function downloadFromDrive(fileId, outPath) {
   const drive = getDrive();
-
   const res = await drive.files.get(
     { fileId, alt: "media" },
     { responseType: "stream" }
@@ -61,50 +61,8 @@ async function downloadFromDrive(fileId, outPath) {
   return outPath;
 }
 
-// -------------------- Local assets served via HTTP (for Remotion/Chromium) --------------------
-const ASSETS = new Map(); // token -> { videoPath, musicPath?, expiresAt }
-
-function createToken() {
-  return crypto.randomBytes(16).toString("hex");
-}
-
-function registerAssets({ videoPath, musicPath }) {
-  const token = createToken();
-  ASSETS.set(token, {
-    videoPath,
-    musicPath,
-    expiresAt: Date.now() + 15 * 60 * 1000,
-  });
-  return token;
-}
-
-function cleanupToken(token) {
-  ASSETS.delete(token);
-}
-
-setInterval(() => {
-  const now = Date.now();
-  for (const [token, v] of ASSETS.entries()) {
-    if (v.expiresAt < now) ASSETS.delete(token);
-  }
-}, 2 * 60 * 1000);
-
-app.get("/asset/:token/video", (req, res) => {
-  const entry = ASSETS.get(req.params.token);
-  if (!entry?.videoPath) return res.status(404).send("Not found");
-  res.setHeader("Content-Type", "video/mp4");
-  fs.createReadStream(entry.videoPath).pipe(res);
-});
-
-app.get("/asset/:token/music", (req, res) => {
-  const entry = ASSETS.get(req.params.token);
-  if (!entry?.musicPath) return res.status(404).send("Not found");
-  res.setHeader("Content-Type", "audio/mpeg");
-  fs.createReadStream(entry.musicPath).pipe(res);
-});
-
-// -------------------- helpers: run ffmpeg/ffprobe --------------------
-function run(cmd, args, { timeoutMs = 120000 } = {}) {
+// -------------------- run ffmpeg/ffprobe --------------------
+function run(cmd, args, { timeoutMs = 180000 } = {}) {
   return new Promise((resolve, reject) => {
     const p = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"] });
 
@@ -145,8 +103,8 @@ async function getVideoDims(filePath) {
   return { w, h };
 }
 
-// ✅ Нормализация айфон-видео (VFR -> CFR), + приводим к H.264/yuv420p
-async function normalizeVideoToCfr(inputPath, fps = TARGET_FPS) {
+// ✅ Нормализация айфон-видео: VFR -> CFR + faststart (чтобы metadata была сразу)
+async function normalizeVideoToCfr(inputPath, fps = OUTPUT_FPS) {
   const outPath = path.join(os.tmpdir(), `cfr-${Date.now()}.mp4`);
 
   await run(
@@ -156,13 +114,13 @@ async function normalizeVideoToCfr(inputPath, fps = TARGET_FPS) {
       "-i",
       inputPath,
 
-      // делаем ровные кадры
+      // делаем ровный FPS
       "-vf",
       `fps=${fps}`,
       "-r",
       String(fps),
 
-      // кодек для стабильного декода в Chromium
+      // стабильный декод в Chromium
       "-c:v",
       "libx264",
       "-preset",
@@ -174,11 +132,11 @@ async function normalizeVideoToCfr(inputPath, fps = TARGET_FPS) {
       "-movflags",
       "+faststart",
 
-      // звук выкидываем — у тебя отдельная музыка
+      // звук выкидываем (музыка отдельной дорожкой)
       "-an",
       outPath,
     ],
-    { timeoutMs: 180000 }
+    { timeoutMs: 240000 }
   );
 
   const stat = fs.statSync(outPath);
@@ -189,42 +147,83 @@ async function normalizeVideoToCfr(inputPath, fps = TARGET_FPS) {
   return outPath;
 }
 
-// (опционально) финализация рендера — если захочешь сделать идеально “инстаграмно”
-// сейчас НЕ используем, потому что рендерим сразу 60fps
-async function finalizeOutputSmooth(inputPath, fps = TARGET_FPS) {
-  const outPath = path.join(os.tmpdir(), `final-${Date.now()}.mp4`);
+// -------------------- Local assets served via HTTP (Chromium needs RANGE) --------------------
+const ASSETS = new Map(); // token -> { videoPath, musicPath?, expiresAt }
 
-  await run(
-    "ffmpeg",
-    [
-      "-y",
-      "-i",
-      inputPath,
-      "-vf",
-      `fps=${fps}`,
-      "-r",
-      String(fps),
-      "-c:v",
-      "libx264",
-      "-preset",
-      "slow",
-      "-crf",
-      "18",
-      "-pix_fmt",
-      "yuv420p",
-      "-movflags",
-      "+faststart",
-      "-c:a",
-      "aac",
-      "-b:a",
-      "192k",
-      outPath,
-    ],
-    { timeoutMs: 240000 }
-  );
-
-  return outPath;
+function createToken() {
+  return crypto.randomBytes(16).toString("hex");
 }
+
+function registerAssets({ videoPath, musicPath }) {
+  const token = createToken();
+  ASSETS.set(token, {
+    videoPath,
+    musicPath,
+    expiresAt: Date.now() + 15 * 60 * 1000,
+  });
+  return token;
+}
+
+function cleanupToken(token) {
+  ASSETS.delete(token);
+}
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [token, v] of ASSETS.entries()) {
+    if (v.expiresAt < now) ASSETS.delete(token);
+  }
+}, 2 * 60 * 1000);
+
+// ✅ Range helper (главное исправление)
+function serveWithRange(req, res, filePath, contentType) {
+  const stat = fs.statSync(filePath);
+  const fileSize = stat.size;
+  const range = req.headers.range;
+
+  res.setHeader("Accept-Ranges", "bytes");
+  res.setHeader("Content-Type", contentType);
+
+  if (!range) {
+    res.setHeader("Content-Length", fileSize);
+    fs.createReadStream(filePath).pipe(res);
+    return;
+  }
+
+  // bytes=start-end
+  const match = String(range).match(/bytes=(\d+)-(\d*)/);
+  if (!match) {
+    res.status(416).end();
+    return;
+  }
+
+  const start = parseInt(match[1], 10);
+  const end = match[2] ? parseInt(match[2], 10) : fileSize - 1;
+
+  if (start >= fileSize || end >= fileSize || start > end) {
+    res.status(416).end();
+    return;
+  }
+
+  const chunkSize = end - start + 1;
+  res.status(206);
+  res.setHeader("Content-Range", `bytes ${start}-${end}/${fileSize}`);
+  res.setHeader("Content-Length", chunkSize);
+
+  fs.createReadStream(filePath, { start, end }).pipe(res);
+}
+
+app.get("/asset/:token/video", (req, res) => {
+  const entry = ASSETS.get(req.params.token);
+  if (!entry?.videoPath) return res.status(404).send("Not found");
+  serveWithRange(req, res, entry.videoPath, "video/mp4");
+});
+
+app.get("/asset/:token/music", (req, res) => {
+  const entry = ASSETS.get(req.params.token);
+  if (!entry?.musicPath) return res.status(404).send("Not found");
+  serveWithRange(req, res, entry.musicPath, "audio/mpeg");
+});
 
 // -------------------- Remotion bundle cache --------------------
 let serveUrl = null;
@@ -250,18 +249,17 @@ app.post("/render", async (req, res) => {
   try {
     const body = req.body || {};
 
-    // вход
     const hook = String(body.hook ?? "");
     const description = String(body.description ?? "");
-
     const durationSecRaw = body.durationSec;
+
     const durationSec = Number.isFinite(Number(durationSecRaw))
       ? Math.min(Math.max(Number(durationSecRaw), MIN_SEC), MAX_SEC)
       : 12;
 
-    // поддержка разных имён полей
     const videoFileId =
       body.videoFileId ?? body.videoFieldId ?? body.videoFileid ?? body.videoFieldid;
+
     const musicFileId =
       body.musicFileId ?? body.musicFieldId ?? body.musicFileid ?? body.musicFieldid;
 
@@ -269,7 +267,7 @@ app.post("/render", async (req, res) => {
 
     const serve = await getBundle();
 
-    // 1) download sources
+    // 1) скачиваем
     localVideo = path.join(os.tmpdir(), `in-video-${Date.now()}.mp4`);
     await downloadFromDrive(videoFileId, localVideo);
 
@@ -278,32 +276,30 @@ app.post("/render", async (req, res) => {
       await downloadFromDrive(musicFileId, localMusic);
     }
 
-    // 2) нормализуем видео (айфон VFR -> CFR 60fps) ✅
-    normalizedVideo = await normalizeVideoToCfr(localVideo, TARGET_FPS);
+    // 2) нормализуем (VFR -> CFR)
+    normalizedVideo = await normalizeVideoToCfr(localVideo, OUTPUT_FPS);
 
-    // 3) orientation -> fitMode
+    // 3) orientation
     const { w, h } = await getVideoDims(normalizedVideo);
     const isHorizontal = w > h;
     const fitMode = isHorizontal ? "contain" : "cover";
 
-    console.log("VIDEO_DIMS:", { w, h, isHorizontal, fitMode, fps: TARGET_FPS });
+    console.log("VIDEO:", { w, h, isHorizontal, fitMode, OUTPUT_FPS });
 
-    // 4) раздаём локальные ассеты (Chromium должен брать по HTTP)
+    // 4) ассеты по HTTP с Range
     token = registerAssets({ videoPath: normalizedVideo, musicPath: localMusic });
 
-    // Внутри контейнера Chromium стучится в этот же сервис — 127.0.0.1 работает
     const baseUrl = `http://127.0.0.1:${PORT}`;
     const videoUrl = `${baseUrl}/asset/${token}/video`;
     const musicUrl = localMusic ? `${baseUrl}/asset/${token}/music` : "";
 
-    // 5) ВАЖНО: отдаём ВСЕ варианты названий, чтобы Short не ломался при смене полей
+    // 5) props под любые варианты Short.tsx
     const inputProps = {
       hook,
       description,
       durationSec,
       fitMode,
 
-      // варианты под разные Short.tsx
       videoUrl,
       musicUrl,
 
@@ -325,20 +321,17 @@ app.post("/render", async (req, res) => {
     await renderMedia({
       composition: {
         ...composition,
-        fps: TARGET_FPS,
-        durationInFrames: Math.round(durationSec * TARGET_FPS),
+        fps: OUTPUT_FPS,
+        durationInFrames: Math.round(durationSec * OUTPUT_FPS),
       },
       serveUrl: serve,
       codec: "h264",
       outputLocation: outPath,
       inputProps,
 
-      // чтобы не падало на медленном старте видео
+      // таймаут увеличили, но теперь не должен упираться в delayRender
       timeoutInMilliseconds: 240000,
     });
-
-    // Если захочешь финализировать (обычно не надо, но можно):
-    // outPath = await finalizeOutputSmooth(outPath, TARGET_FPS);
 
     res.setHeader("Content-Type", "video/mp4");
     res.setHeader("Content-Disposition", `attachment; filename="short.mp4"`);
@@ -370,5 +363,5 @@ app.post("/render", async (req, res) => {
 });
 
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`Remotion renderer running on ${PORT}`);
+  console.log(`Remotion renderer running on ${PORT}, OUTPUT_FPS=${OUTPUT_FPS}`);
 });
