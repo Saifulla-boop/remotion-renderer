@@ -4,6 +4,7 @@ import path from "path";
 import fs from "fs";
 import fsp from "fs/promises";
 import crypto from "crypto";
+import { spawn } from "child_process";
 
 import { bundle } from "@remotion/bundler";
 import { renderMedia, selectComposition } from "@remotion/renderer";
@@ -24,6 +25,16 @@ const JOB_CLEANUP_EVERY_SEC = Number(process.env.JOB_CLEANUP_EVERY_SEC || 60);
 
 const MIN_SEC = 6;
 const MAX_SEC = 30;
+
+// ВАЖНОЕ УСКОРЕНИЕ: не 1 поток всегда.
+// На Railway часто 2 vCPU → ставим 2. На 4 vCPU → ставим 3-4.
+const CPU = os.cpus()?.length || 2;
+const RENDER_CONCURRENCY = Number(
+  process.env.RENDER_CONCURRENCY || Math.min(4, Math.max(2, CPU))
+);
+
+// Минимальная “подготовка для Chromium”
+const PREPARE_FOR_CHROMIUM = (process.env.PREPARE_FOR_CHROMIUM ?? "1") === "1";
 
 // -------------------- Drive (Service Account, READONLY) --------------------
 function getDrive() {
@@ -64,6 +75,101 @@ async function downloadFromDrive(fileId, outPath) {
   }
 
   return outPath;
+}
+
+// -------------------- ffmpeg helpers --------------------
+function run(cmd, args, { timeoutMs = 10 * 60 * 1000 } = {}) {
+  return new Promise((resolve, reject) => {
+    const p = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"] });
+
+    let stdout = "";
+    let stderr = "";
+
+    p.stdout.on("data", (d) => (stdout += d.toString()));
+    p.stderr.on("data", (d) => (stderr += d.toString()));
+
+    const t = setTimeout(() => {
+      try {
+        p.kill("SIGKILL");
+      } catch {}
+      reject(new Error(`Command timeout: ${cmd} ${args.join(" ")}`));
+    }, timeoutMs);
+
+    p.on("close", (code) => {
+      clearTimeout(t);
+      if (code === 0) return resolve({ stdout, stderr });
+      reject(new Error(`Command failed (${code}): ${cmd} ${args.join(" ")}\n${stderr}`));
+    });
+  });
+}
+
+/**
+ * Минимальная подготовка видео “для Chromium”, чтобы:
+ * - ушёл progress=0 (Chromium может “не стартовать”, если контейнер/моов/кодеки не те)
+ * Логика:
+ * 1) быстрый remux: mp4 контейнер + faststart, без перекодирования (почти бесплатно)
+ * 2) если не вышло → fallback transcode (быстро, но надёжно)
+ */
+async function prepareVideoForChromium(inputPath, jobId) {
+  const outRemux = path.join(os.tmpdir(), `job-${jobId}-video-remux.mp4`);
+  const outTranscode = path.join(os.tmpdir(), `job-${jobId}-video-x264.mp4`);
+
+  // 1) REMUX (быстро)
+  try {
+    await run("ffmpeg", [
+      "-y",
+      "-i",
+      inputPath,
+      "-map",
+      "0:v:0?",
+      "-map",
+      "0:a:0?",
+      "-c",
+      "copy",
+      "-movflags",
+      "+faststart",
+      outRemux,
+    ], { timeoutMs: 3 * 60 * 1000 });
+
+    const st = fs.statSync(outRemux);
+    if (st.size > 1024) {
+      console.log(`[job ${jobId}] ffmpeg remux OK (${Math.round(st.size / 1024 / 1024)}MB)`);
+      return outRemux;
+    }
+  } catch (e) {
+    console.log(`[job ${jobId}] ffmpeg remux failed → fallback transcode`);
+  }
+
+  // 2) TRANSCODE (надёжно)
+  await run("ffmpeg", [
+    "-y",
+    "-i",
+    inputPath,
+    "-vf",
+    "format=yuv420p",
+    "-c:v",
+    "libx264",
+    "-preset",
+    "veryfast",
+    "-crf",
+    "23",
+    "-profile:v",
+    "main",
+    "-pix_fmt",
+    "yuv420p",
+    "-movflags",
+    "+faststart",
+    "-c:a",
+    "aac",
+    "-b:a",
+    "128k",
+    outTranscode,
+  ], { timeoutMs: 12 * 60 * 1000 });
+
+  const st2 = fs.statSync(outTranscode);
+  if (!st2.size || st2.size < 1024) throw new Error("ffmpeg transcode produced empty file");
+  console.log(`[job ${jobId}] ffmpeg transcode OK (${Math.round(st2.size / 1024 / 1024)}MB)`);
+  return outTranscode;
 }
 
 // -------------------- Asset serving (for Chromium) --------------------
@@ -150,17 +256,9 @@ async function getBundle() {
 }
 
 // -------------------- JOB QUEUE (in-memory) --------------------
-/**
- * status:
- *  - queued
- *  - rendering
- *  - done
- *  - error
- */
 const JOBS = new Map(); // jobId -> job
 
 function newJobId() {
-  // Node 18 имеет randomUUID
   return crypto.randomUUID ? crypto.randomUUID() : crypto.randomBytes(16).toString("hex");
 }
 
@@ -189,6 +287,7 @@ async function cleanupOldJobs() {
       if (job.outPath) await fsp.unlink(job.outPath).catch(() => {});
       if (job.localVideo) await fsp.unlink(job.localVideo).catch(() => {});
       if (job.localMusic) await fsp.unlink(job.localMusic).catch(() => {});
+      if (job.preparedVideo) await fsp.unlink(job.preparedVideo).catch(() => {});
     } catch {}
 
     JOBS.delete(id);
@@ -209,17 +308,14 @@ async function processJob(jobId) {
   job.startedAt = Date.now();
   job.progress = 0;
   job.updatedAtIso = nowIso();
-
   console.log(`[job ${jobId}] start`);
-
-  let assetToken = null;
 
   try {
     const serve = await getBundle();
 
-    // 1) download sources
-    const localVideo = path.join(os.tmpdir(), `job-${jobId}-video.mp4`);
-    await downloadFromDrive(job.payload.videoFileId, localVideo);
+    // 1) download raw sources
+    const rawVideo = path.join(os.tmpdir(), `job-${jobId}-video-raw`);
+    await downloadFromDrive(job.payload.videoFileId, rawVideo);
 
     let localMusic = null;
     if (job.payload.musicFileId) {
@@ -227,18 +323,25 @@ async function processJob(jobId) {
       await downloadFromDrive(job.payload.musicFileId, localMusic);
     }
 
-    job.localVideo = localVideo;
+    job.localVideo = rawVideo;
     job.localMusic = localMusic;
 
-    // 2) register local assets and create URLs for Chromium
-    assetToken = registerAssets({ videoPath: localVideo, musicPath: localMusic });
+    // 2) минимальная подготовка видео для Chromium (быстро + fallback)
+    let localVideo = rawVideo;
+    if (PREPARE_FOR_CHROMIUM) {
+      localVideo = await prepareVideoForChromium(rawVideo, jobId);
+      job.preparedVideo = localVideo;
+    }
+
+    // 3) register local assets and create URLs for Chromium
+    const assetToken = registerAssets({ videoPath: localVideo, musicPath: localMusic });
     job.assetToken = assetToken;
 
     const baseUrl = `http://127.0.0.1:${PORT}`;
     const videoUrl = `${baseUrl}/asset/${assetToken}/video`;
     const musicUrl = localMusic ? `${baseUrl}/asset/${assetToken}/music` : "";
 
-    // 3) inputProps (передаём ВСЕ варианты имён)
+    // 4) inputProps
     const inputProps = {
       hook: safeStr(job.payload.hook),
       description: safeStr(job.payload.description),
@@ -246,32 +349,29 @@ async function processJob(jobId) {
 
       videoUrl,
       musicUrl,
-
       videoSrc: videoUrl,
       musicSrc: musicUrl,
-
       videoPath: videoUrl,
       musicPath: musicUrl,
 
-      // громкость
       videoVolume: job.payload.videoVolume,
       musicVolume: job.payload.musicVolume,
     };
 
-    // 4) select composition (валидируем что всё ок)
+    // 5) select composition
     const composition = await selectComposition({
       serveUrl: serve,
       id: COMPOSITION_ID,
       inputProps,
     });
 
-    // 5) output
+    // 6) output
     const outPath = path.join(os.tmpdir(), `job-${jobId}-out.mp4`);
     job.outPath = outPath;
 
     const durationInFrames = Math.round(job.payload.durationSec * OUTPUT_FPS);
 
-    // 6) render with progress logs
+    // 7) render (ускорили concurrency)
     let lastLog = 0;
 
     await renderMedia({
@@ -286,7 +386,6 @@ async function processJob(jobId) {
       outputLocation: outPath,
       inputProps,
 
-      // стабильность в контейнере
       chromiumOptions: {
         args: [
           "--no-sandbox",
@@ -295,15 +394,14 @@ async function processJob(jobId) {
         ],
       },
 
-      // чтобы не убивать CPU пиками
-      concurrency: 1,
+      // СКОРОСТЬ: было 1 → стало авто по CPU
+      concurrency: RENDER_CONCURRENCY,
 
-      // таймауты — увеличены, но они теперь редко нужны (мы не держим HTTP)
+      // Таймауты
       timeoutInMilliseconds: 30 * 60 * 1000,
       delayRenderTimeoutInMilliseconds: 10 * 60 * 1000,
 
       onProgress: (p) => {
-        // Remotion может отдавать разные поля, берём максимально надёжно
         const overall =
           typeof p?.overallProgress === "number"
             ? p.overallProgress
@@ -312,19 +410,20 @@ async function processJob(jobId) {
             : null;
 
         if (overall !== null) job.progress = Math.max(0, Math.min(1, overall));
-
         job.updatedAtIso = nowIso();
 
         const nowT = Date.now();
         if (nowT - lastLog > 1500) {
           lastLog = nowT;
           const percent = Math.round((job.progress || 0) * 100);
-          console.log(`[job ${jobId}] progress ${percent}%`);
+          const framesDone = Math.round((job.progress || 0) * durationInFrames);
+          console.log(
+            `[job ${jobId}] ${percent}% (${framesDone}/${durationInFrames} frames) concurrency=${RENDER_CONCURRENCY}`
+          );
         }
       },
     });
 
-    // sanity
     const stat = fs.statSync(outPath);
     if (!stat.size || stat.size < 1024) throw new Error("Output mp4 is too small");
 
@@ -341,22 +440,13 @@ async function processJob(jobId) {
     job.error = String(e?.message || e);
     job.finishedAt = Date.now();
     job.updatedAtIso = nowIso();
-
     console.log(`[job ${jobId}] ERROR:`, job.error);
-  } finally {
-    // asset token держим — нужен до скачивания результата.
-    // автоочистка удалит позже по TTL.
   }
 }
 
 // -------------------- Routes --------------------
 app.get("/health", (_, res) => res.json({ ok: true }));
 
-/**
- * POST /render
- * body: { hook, description, durationSec, videoFileId, musicFileId?, videoVolume?, musicVolume? }
- * returns: { jobId }
- */
 app.post("/render", (req, res) => {
   try {
     const body = req.body || {};
@@ -393,7 +483,6 @@ app.post("/render", (req, res) => {
       createdAtIso: nowIso(),
       updatedAtIso: nowIso(),
 
-      // всё, что нужно рендеру
       payload: {
         hook: safeStr(body.hook),
         description: safeStr(body.description),
@@ -402,35 +491,26 @@ app.post("/render", (req, res) => {
         videoFileId: String(videoFileId),
         musicFileId: musicFileId ? String(musicFileId) : "",
 
-        // громкости (опционально)
-        videoVolume:
-          typeof body.videoVolume === "number" ? body.videoVolume : 1,
-        musicVolume:
-          typeof body.musicVolume === "number" ? body.musicVolume : 0.35,
+        videoVolume: typeof body.videoVolume === "number" ? body.videoVolume : 1,
+        musicVolume: typeof body.musicVolume === "number" ? body.musicVolume : 0.35,
       },
 
-      // runtime fields
       startedAt: null,
       finishedAt: null,
       outPath: null,
       localVideo: null,
+      preparedVideo: null,
       localMusic: null,
       assetToken: null,
     });
 
-    // запускаем рендер в фоне
     setImmediate(() => processJob(jobId));
-
     return res.json({ ok: true, jobId });
   } catch (e) {
     return res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 });
 
-/**
- * GET /status/:jobId
- * returns status + progress + error
- */
 app.get("/status/:jobId", (req, res) => {
   const job = JOBS.get(req.params.jobId);
   if (!job) return res.status(404).json({ ok: false, error: "Job not found" });
@@ -446,10 +526,6 @@ app.get("/status/:jobId", (req, res) => {
   });
 });
 
-/**
- * GET /download/:jobId
- * returns mp4 file (attachment)
- */
 app.get("/download/:jobId", (req, res) => {
   const job = JOBS.get(req.params.jobId);
   if (!job) return res.status(404).send("Job not found");
@@ -462,7 +538,6 @@ app.get("/download/:jobId", (req, res) => {
     return res.status(410).send("File missing");
   }
 
-  // отдаём файлом (как ты и сделал — на телефонах это лучше)
   res.setHeader("Content-Type", "video/mp4");
   res.setHeader("Content-Disposition", `attachment; filename="short-${job.id}.mp4"`);
 
@@ -473,4 +548,5 @@ app.listen(PORT, "0.0.0.0", () => {
   console.log(`Remotion renderer async running on ${PORT}`);
   console.log(`COMPOSITION_ID=${COMPOSITION_ID}, OUTPUT_FPS=${OUTPUT_FPS}`);
   console.log(`JOB_TTL_MIN=${JOB_TTL_MIN}, CLEANUP_EVERY_SEC=${JOB_CLEANUP_EVERY_SEC}`);
+  console.log(`PREPARE_FOR_CHROMIUM=${PREPARE_FOR_CHROMIUM}, RENDER_CONCURRENCY=${RENDER_CONCURRENCY}, CPU=${CPU}`);
 });
