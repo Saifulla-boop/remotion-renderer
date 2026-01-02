@@ -23,7 +23,6 @@ const COMPOSITION_ID = process.env.COMPOSITION_ID || "Short";
 
 const cleanId = (s) => String(s || "").replace(/^=+/, "").trim();
 
-// ========= GOOGLE DRIVE (Service Account) =========
 function requireEnv(name) {
   const v = process.env[name];
   if (!v) throw new Error(`Missing env var: ${name}`);
@@ -34,7 +33,7 @@ function getDriveClient() {
   const clientEmail = requireEnv("GOOGLE_CLIENT_EMAIL");
   let privateKey = requireEnv("GOOGLE_PRIVATE_KEY");
 
-  // Railway часто хранит ключ с \n как текст — восстанавливаем:
+  // Railway обычно хранит ключ с \n — восстанавливаем
   privateKey = privateKey.replace(/\\n/g, "\n");
 
   const auth = new google.auth.JWT({
@@ -49,43 +48,36 @@ function getDriveClient() {
 const drive = getDriveClient();
 
 /**
- * Скачиваем файл из Drive API во временный файл
- * Обходит confirm/virus-scan и "Drive returned HTML"
+ * Скачиваем файл из Google Drive по fileId во временный файл
+ * ВАЖНО: service account должен иметь доступ к файлу/папке (шаринг на email service account)
  */
 async function downloadToTmp({ fileId, ext }) {
   const safeId = cleanId(fileId);
   if (!safeId) throw new Error("downloadToTmp: fileId is empty");
 
   const tmpPath = path.join(os.tmpdir(), `${Date.now()}-${safeId}.${ext}`);
-  const dest = fs.createWriteStream(tmpPath);
 
-  let resp;
-  try {
-    resp = await drive.files.get(
-      { fileId: safeId, alt: "media" },
-      { responseType: "stream" }
-    );
-  } catch (e) {
-    // частые причины: нет доступа, файл не найден, не расшарено на service account
-    const msg = e?.response?.data?.error?.message || e?.message || String(e);
-    throw new Error(`Drive API download failed for fileId=${safeId}: ${msg}`);
-  }
+  // Drive API stream
+  const resp = await drive.files.get(
+    { fileId: safeId, alt: "media" },
+    { responseType: "stream" }
+  );
 
-  if (!resp?.data) throw new Error(`Drive API: empty stream for fileId=${safeId}`);
+  if (!resp?.data) throw new Error("Drive API returned empty stream");
 
-  await pipeline(resp.data, dest);
+  const out = fs.createWriteStream(tmpPath);
+  await pipeline(resp.data, out);
 
   const stat = fs.statSync(tmpPath);
   if (!stat.size || stat.size < 1024) {
     throw new Error(
-      `Downloaded file looks wrong (size=${stat.size}). fileId=${safeId}`
+      `Downloaded file too small (size=${stat.size}). fileId=${safeId}`
     );
   }
 
   return tmpPath;
 }
 
-// ========= REMOTION =========
 let bundleLocation = null;
 let compositionsCache = null;
 
@@ -117,19 +109,19 @@ app.post("/render", async (req, res) => {
     const description = body.description ?? "";
     const durationSec = body.durationSec;
 
-    // ✅ поддержка обоих вариантов имен (fileId vs fieldId)
+    // ✅ поддержка обоих вариантов имен
     const videoFileId =
       body.videoFileId ?? body.videoFieldId ?? body.videoFileid ?? body.videoFieldid;
     const musicFileId =
       body.musicFileId ?? body.musicFieldId ?? body.musicFileid ?? body.musicFieldid;
 
+    // ---- Валидация
     if (!hook || typeof hook !== "string") {
       throw new Error("hook is missing (string required)");
     }
     if (typeof description !== "string") {
       throw new Error("description must be a string");
     }
-
     if (!videoFileId || typeof videoFileId !== "string") {
       throw new Error("videoFileId (or videoFieldId) is missing (string required)");
     }
@@ -150,10 +142,11 @@ app.post("/render", async (req, res) => {
       durationSec: dur,
     });
 
-    // ---- Скачиваем исходники через Drive API
+    // ---- Скачиваем исходники через Drive API (без confirm/virus страниц)
     const videoPath = await downloadToTmp({ fileId: videoFileId, ext: "mp4" });
     const musicPath = await downloadToTmp({ fileId: musicFileId, ext: "mp3" });
 
+    // ---- Находим композицию
     const comps =
       compositionsCache || (await getCompositions(bundleLocation, { inputProps: {} }));
 
@@ -188,6 +181,12 @@ app.post("/render", async (req, res) => {
       codec: "h264",
       outputLocation: outPath,
       inputProps,
+
+      // если нужно — можно явно указать chromium:
+      // chromiumOptions: {
+      //   executablePath:
+      //     process.env.PUPPETEER_EXECUTABLE_PATH || process.env.CHROME_BIN,
+      // },
     });
 
     res.setHeader("Content-Type", "video/mp4");
@@ -197,15 +196,9 @@ app.post("/render", async (req, res) => {
     stream.pipe(res);
 
     stream.on("close", () => {
-      try {
-        fs.unlinkSync(outPath);
-      } catch {}
-      try {
-        fs.unlinkSync(videoPath);
-      } catch {}
-      try {
-        fs.unlinkSync(musicPath);
-      } catch {}
+      try { fs.unlinkSync(outPath); } catch {}
+      try { fs.unlinkSync(videoPath); } catch {}
+      try { fs.unlinkSync(musicPath); } catch {}
     });
   } catch (e) {
     console.error("[render] error:", e);
