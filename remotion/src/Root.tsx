@@ -5,7 +5,6 @@ import { Short } from "./Short";
 export const RemotionRoot: React.FC = () => {
   return (
     <>
-    
       <Composition
         id="Short"
         component={Short}
@@ -14,13 +13,14 @@ export const RemotionRoot: React.FC = () => {
         fps={30}
         durationInFrames={30 * 12}
         defaultProps={{
-          // важно: названия должны совпадать с тем,
-          // что ты используешь в Short.tsx и что приходит с сервера
-          hook: "",
-          description: "",
+          hook: "Почему нет продаж?",
+          videoUrl: "",
+          musicUrl: "",
           durationSec: 12,
-          videoPath: "",
-          musicPath: "",
+
+          // === НОВОЕ ===
+          // Позиция текста: "top" или "center"
+          textPosition: "top",
         }}
       />
     </>
