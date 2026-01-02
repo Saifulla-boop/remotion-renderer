@@ -5,6 +5,7 @@ import { Short } from "./Short";
 export const RemotionRoot: React.FC = () => {
   return (
     <>
+    
       <Composition
         id="Short"
         component={Short}
