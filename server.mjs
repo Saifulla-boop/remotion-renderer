@@ -26,15 +26,51 @@ const JOB_CLEANUP_EVERY_SEC = Number(process.env.JOB_CLEANUP_EVERY_SEC || 60);
 const MIN_SEC = 6;
 const MAX_SEC = 30;
 
-// ВАЖНОЕ УСКОРЕНИЕ: не 1 поток всегда.
-// На Railway часто 2 vCPU → ставим 2. На 4 vCPU → ставим 3-4.
-const CPU = os.cpus()?.length || 2;
-const RENDER_CONCURRENCY = Number(
-  process.env.RENDER_CONCURRENCY || Math.min(4, Math.max(2, CPU))
-);
+// ffmpeg настройки (можно тюнить без правок кода)
+const FFMPEG_CRF = process.env.FFMPEG_CRF || "23"; // меньше = качество выше, но медленнее
+const FFMPEG_PRESET = process.env.FFMPEG_PRESET || "veryfast"; // veryfast / faster / fast
 
-// Минимальная “подготовка для Chromium”
-const PREPARE_FOR_CHROMIUM = (process.env.PREPARE_FOR_CHROMIUM ?? "1") === "1";
+// -------------------- helpers --------------------
+function nowIso() {
+  return new Date().toISOString();
+}
+
+function safeStr(x) {
+  return typeof x === "string" ? x : "";
+}
+
+function newJobId() {
+  return crypto.randomUUID ? crypto.randomUUID() : crypto.randomBytes(16).toString("hex");
+}
+
+// Запуск команд (ffmpeg)
+function run(cmd, args, { timeoutMs = 10 * 60 * 1000 } = {}) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"] });
+
+    let stdout = "";
+    let stderr = "";
+
+    child.stdout.on("data", (d) => (stdout += d.toString()));
+    child.stderr.on("data", (d) => (stderr += d.toString()));
+
+    const t = setTimeout(() => {
+      child.kill("SIGKILL");
+      reject(new Error(`${cmd} timeout after ${timeoutMs}ms\n${stderr}`));
+    }, timeoutMs);
+
+    child.on("error", (err) => {
+      clearTimeout(t);
+      reject(err);
+    });
+
+    child.on("close", (code) => {
+      clearTimeout(t);
+      if (code === 0) return resolve({ stdout, stderr });
+      reject(new Error(`${cmd} exited with code ${code}\n${stderr}`));
+    });
+  });
+}
 
 // -------------------- Drive (Service Account, READONLY) --------------------
 function getDrive() {
@@ -77,98 +113,42 @@ async function downloadFromDrive(fileId, outPath) {
   return outPath;
 }
 
-// -------------------- ffmpeg helpers --------------------
-function run(cmd, args, { timeoutMs = 10 * 60 * 1000 } = {}) {
-  return new Promise((resolve, reject) => {
-    const p = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"] });
-
-    let stdout = "";
-    let stderr = "";
-
-    p.stdout.on("data", (d) => (stdout += d.toString()));
-    p.stderr.on("data", (d) => (stderr += d.toString()));
-
-    const t = setTimeout(() => {
-      try {
-        p.kill("SIGKILL");
-      } catch {}
-      reject(new Error(`Command timeout: ${cmd} ${args.join(" ")}`));
-    }, timeoutMs);
-
-    p.on("close", (code) => {
-      clearTimeout(t);
-      if (code === 0) return resolve({ stdout, stderr });
-      reject(new Error(`Command failed (${code}): ${cmd} ${args.join(" ")}\n${stderr}`));
-    });
-  });
-}
-
-/**
- * Минимальная подготовка видео “для Chromium”, чтобы:
- * - ушёл progress=0 (Chromium может “не стартовать”, если контейнер/моов/кодеки не те)
- * Логика:
- * 1) быстрый remux: mp4 контейнер + faststart, без перекодирования (почти бесплатно)
- * 2) если не вышло → fallback transcode (быстро, но надёжно)
- */
+// -------------------- ✅ Минимальная конвертация “для Chromium” --------------------
+// ВАЖНО: не remux, а перекод в H.264, иначе HEVC (айфон) даст Code 4 и progress=0
 async function prepareVideoForChromium(inputPath, jobId) {
-  const outRemux = path.join(os.tmpdir(), `job-${jobId}-video-remux.mp4`);
   const outTranscode = path.join(os.tmpdir(), `job-${jobId}-video-x264.mp4`);
 
-  // 1) REMUX (быстро)
-  try {
-    await run("ffmpeg", [
+  console.log(`[job ${jobId}] ffmpeg transcode -> H.264 (${FFMPEG_PRESET}, crf=${FFMPEG_CRF})`);
+
+  await run(
+    "ffmpeg",
+    [
       "-y",
       "-i",
       inputPath,
-      "-map",
-      "0:v:0?",
-      "-map",
-      "0:a:0?",
-      "-c",
-      "copy",
-      "-movflags",
-      "+faststart",
-      outRemux,
-    ], { timeoutMs: 3 * 60 * 1000 });
 
-    const st = fs.statSync(outRemux);
-    if (st.size > 1024) {
-      console.log(`[job ${jobId}] ffmpeg remux OK (${Math.round(st.size / 1024 / 1024)}MB)`);
-      return outRemux;
-    }
-  } catch (e) {
-    console.log(`[job ${jobId}] ffmpeg remux failed → fallback transcode`);
-  }
+      // видео (Chromium-safe)
+      "-c:v", "libx264",
+      "-preset", FFMPEG_PRESET,
+      "-crf", String(FFMPEG_CRF),
+      "-pix_fmt", "yuv420p",
 
-  // 2) TRANSCODE (надёжно)
-  await run("ffmpeg", [
-    "-y",
-    "-i",
-    inputPath,
-    "-vf",
-    "format=yuv420p",
-    "-c:v",
-    "libx264",
-    "-preset",
-    "veryfast",
-    "-crf",
-    "23",
-    "-profile:v",
-    "main",
-    "-pix_fmt",
-    "yuv420p",
-    "-movflags",
-    "+faststart",
-    "-c:a",
-    "aac",
-    "-b:a",
-    "128k",
-    outTranscode,
-  ], { timeoutMs: 12 * 60 * 1000 });
+      // аудио (на всякий случай)
+      "-c:a", "aac",
+      "-b:a", "128k",
 
-  const st2 = fs.statSync(outTranscode);
-  if (!st2.size || st2.size < 1024) throw new Error("ffmpeg transcode produced empty file");
-  console.log(`[job ${jobId}] ffmpeg transcode OK (${Math.round(st2.size / 1024 / 1024)}MB)`);
+      // быстрый старт mp4
+      "-movflags", "+faststart",
+
+      outTranscode,
+    ],
+    { timeoutMs: 25 * 60 * 1000 }
+  );
+
+  const st = fs.statSync(outTranscode);
+  if (!st.size || st.size < 1024) throw new Error("ffmpeg transcode produced empty file");
+
+  console.log(`[job ${jobId}] ffmpeg OK (${Math.round(st.size / 1024 / 1024)}MB)`);
   return outTranscode;
 }
 
@@ -256,19 +236,14 @@ async function getBundle() {
 }
 
 // -------------------- JOB QUEUE (in-memory) --------------------
+/**
+ * status:
+ *  - queued
+ *  - rendering
+ *  - done
+ *  - error
+ */
 const JOBS = new Map(); // jobId -> job
-
-function newJobId() {
-  return crypto.randomUUID ? crypto.randomUUID() : crypto.randomBytes(16).toString("hex");
-}
-
-function nowIso() {
-  return new Date().toISOString();
-}
-
-function safeStr(x) {
-  return typeof x === "string" ? x : "";
-}
 
 // автоочистка job’ов + файлов
 async function cleanupOldJobs() {
@@ -277,9 +252,7 @@ async function cleanupOldJobs() {
 
   for (const [id, job] of JOBS.entries()) {
     const age = now - job.createdAt;
-    const canDelete =
-      age > ttlMs && (job.status === "done" || job.status === "error");
-
+    const canDelete = age > ttlMs && (job.status === "done" || job.status === "error");
     if (!canDelete) continue;
 
     try {
@@ -287,7 +260,7 @@ async function cleanupOldJobs() {
       if (job.outPath) await fsp.unlink(job.outPath).catch(() => {});
       if (job.localVideo) await fsp.unlink(job.localVideo).catch(() => {});
       if (job.localMusic) await fsp.unlink(job.localMusic).catch(() => {});
-      if (job.preparedVideo) await fsp.unlink(job.preparedVideo).catch(() => {});
+      if (job.chromiumVideo) await fsp.unlink(job.chromiumVideo).catch(() => {});
     } catch {}
 
     JOBS.delete(id);
@@ -308,14 +281,17 @@ async function processJob(jobId) {
   job.startedAt = Date.now();
   job.progress = 0;
   job.updatedAtIso = nowIso();
+
   console.log(`[job ${jobId}] start`);
+
+  let assetToken = null;
 
   try {
     const serve = await getBundle();
 
-    // 1) download raw sources
-    const rawVideo = path.join(os.tmpdir(), `job-${jobId}-video-raw`);
-    await downloadFromDrive(job.payload.videoFileId, rawVideo);
+    // 1) download sources (как есть)
+    const localVideoRaw = path.join(os.tmpdir(), `job-${jobId}-video-raw`);
+    await downloadFromDrive(job.payload.videoFileId, localVideoRaw);
 
     let localMusic = null;
     if (job.payload.musicFileId) {
@@ -323,18 +299,15 @@ async function processJob(jobId) {
       await downloadFromDrive(job.payload.musicFileId, localMusic);
     }
 
-    job.localVideo = rawVideo;
+    job.localVideo = localVideoRaw;
     job.localMusic = localMusic;
 
-    // 2) минимальная подготовка видео для Chromium (быстро + fallback)
-    let localVideo = rawVideo;
-    if (PREPARE_FOR_CHROMIUM) {
-      localVideo = await prepareVideoForChromium(rawVideo, jobId);
-      job.preparedVideo = localVideo;
-    }
+    // 2) ✅ привести видео к H.264 для Chromium
+    const localVideo = await prepareVideoForChromium(localVideoRaw, jobId);
+    job.chromiumVideo = localVideo;
 
     // 3) register local assets and create URLs for Chromium
-    const assetToken = registerAssets({ videoPath: localVideo, musicPath: localMusic });
+    assetToken = registerAssets({ videoPath: localVideo, musicPath: localMusic });
     job.assetToken = assetToken;
 
     const baseUrl = `http://127.0.0.1:${PORT}`;
@@ -349,8 +322,10 @@ async function processJob(jobId) {
 
       videoUrl,
       musicUrl,
+
       videoSrc: videoUrl,
       musicSrc: musicUrl,
+
       videoPath: videoUrl,
       musicPath: musicUrl,
 
@@ -371,7 +346,7 @@ async function processJob(jobId) {
 
     const durationInFrames = Math.round(job.payload.durationSec * OUTPUT_FPS);
 
-    // 7) render (ускорили concurrency)
+    // 7) render with progress logs
     let lastLog = 0;
 
     await renderMedia({
@@ -394,10 +369,10 @@ async function processJob(jobId) {
         ],
       },
 
-      // СКОРОСТЬ: было 1 → стало авто по CPU
-      concurrency: RENDER_CONCURRENCY,
+      // ⚡ ускорение: Railway обычно тянет 2-4 в зависимости от CPU
+      // попробуй 3, если будет лагать — вернёшь на 2
+      concurrency: Number(process.env.RENDER_CONCURRENCY || 3),
 
-      // Таймауты
       timeoutInMilliseconds: 30 * 60 * 1000,
       delayRenderTimeoutInMilliseconds: 10 * 60 * 1000,
 
@@ -416,10 +391,7 @@ async function processJob(jobId) {
         if (nowT - lastLog > 1500) {
           lastLog = nowT;
           const percent = Math.round((job.progress || 0) * 100);
-          const framesDone = Math.round((job.progress || 0) * durationInFrames);
-          console.log(
-            `[job ${jobId}] ${percent}% (${framesDone}/${durationInFrames} frames) concurrency=${RENDER_CONCURRENCY}`
-          );
+          console.log(`[job ${jobId}] progress ${percent}%`);
         }
       },
     });
@@ -440,6 +412,7 @@ async function processJob(jobId) {
     job.error = String(e?.message || e);
     job.finishedAt = Date.now();
     job.updatedAtIso = nowIso();
+
     console.log(`[job ${jobId}] ERROR:`, job.error);
   }
 }
@@ -447,6 +420,9 @@ async function processJob(jobId) {
 // -------------------- Routes --------------------
 app.get("/health", (_, res) => res.json({ ok: true }));
 
+/**
+ * POST /render
+ */
 app.post("/render", (req, res) => {
   try {
     const body = req.body || {};
@@ -499,12 +475,13 @@ app.post("/render", (req, res) => {
       finishedAt: null,
       outPath: null,
       localVideo: null,
-      preparedVideo: null,
+      chromiumVideo: null,
       localMusic: null,
       assetToken: null,
     });
 
     setImmediate(() => processJob(jobId));
+
     return res.json({ ok: true, jobId });
   } catch (e) {
     return res.status(500).json({ ok: false, error: String(e?.message || e) });
@@ -548,5 +525,6 @@ app.listen(PORT, "0.0.0.0", () => {
   console.log(`Remotion renderer async running on ${PORT}`);
   console.log(`COMPOSITION_ID=${COMPOSITION_ID}, OUTPUT_FPS=${OUTPUT_FPS}`);
   console.log(`JOB_TTL_MIN=${JOB_TTL_MIN}, CLEANUP_EVERY_SEC=${JOB_CLEANUP_EVERY_SEC}`);
-  console.log(`PREPARE_FOR_CHROMIUM=${PREPARE_FOR_CHROMIUM}, RENDER_CONCURRENCY=${RENDER_CONCURRENCY}, CPU=${CPU}`);
+  console.log(`FFMPEG_PRESET=${FFMPEG_PRESET}, FFMPEG_CRF=${FFMPEG_CRF}`);
+  console.log(`RENDER_CONCURRENCY=${process.env.RENDER_CONCURRENCY || 3}`);
 });
