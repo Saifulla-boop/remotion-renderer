@@ -59,7 +59,7 @@ async function downloadFromDrive(fileId, outPath) {
 }
 
 // -------------------- helpers --------------------
-function run(cmd, args, { timeoutMs = 8 * 60 * 1000 } = {}) {
+function run(cmd, args, { timeoutMs = 10 * 60 * 1000 } = {}) {
   return new Promise((resolve, reject) => {
     const p = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"] });
 
@@ -100,22 +100,21 @@ async function getVideoDims(filePath) {
   return { w, h };
 }
 
-// ✅ КЛЮЧ: нормализация айфон-видео → CFR 30 + H264 + yuv420p (убирает фризы и чёрные вспышки)
-async function normalizeVideo(inPath, outPath) {
-  // Важно: scale до чётных, fps фиксируем, формат делаем максимально совместимым.
-  // Это же часто убирает “black flashes” на HEVC/HDR.
+// ✅ Нормализация БЕЗ ПРИНУДИТЕЛЬНОГО fps!
+// Только совместимость: H264 + yuv420p + чётные размеры.
+// Это лечит чёрные моргания и не ломает плавность.
+async function normalizeVideoNoFps(inPath, outPath) {
   await run("ffmpeg", [
     "-y",
     "-hide_banner",
     "-loglevel",
     "error",
-
     "-i",
     inPath,
 
-    // видео: CFR 30, чётные размеры, SDR-compatible пиксельный формат
+    // НЕ fps=30! только scale-even + pixel format
     "-vf",
-    `fps=${OUTPUT_FPS},scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p`,
+    "scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p",
 
     "-c:v",
     "libx264",
@@ -128,7 +127,7 @@ async function normalizeVideo(inPath, outPath) {
     "-crf",
     "18",
 
-    // audio: оставляем звук исходника, приводим к нормальному AAC
+    // сохраняем звук исходника (если есть)
     "-c:a",
     "aac",
     "-b:a",
@@ -136,12 +135,17 @@ async function normalizeVideo(inPath, outPath) {
     "-ar",
     "48000",
 
-    // для корректной отдачи/чтения
     "-movflags",
     "+faststart",
 
     outPath,
   ]);
+
+  const stat = fs.statSync(outPath);
+  if (!stat.size || stat.size < 1024) {
+    throw new Error(`Normalized file too small (${stat.size})`);
+  }
+
   return outPath;
 }
 
@@ -170,7 +174,7 @@ setInterval(() => {
   }
 }, 2 * 60 * 1000);
 
-// Range очень помогает, чтобы Chromium не “ждал” целиком файл
+// ✅ Range support — снижает таймауты/фризы при чтении Chromium
 function addRangeSupport(req, res, filePath, contentType) {
   const stat = fs.statSync(filePath);
   const fileSize = stat.size;
@@ -186,18 +190,12 @@ function addRangeSupport(req, res, filePath, contentType) {
   }
 
   const match = /bytes=(\d+)-(\d*)/.exec(range);
-  if (!match) {
-    res.status(416).end();
-    return;
-  }
+  if (!match) return res.status(416).end();
 
   const start = Number(match[1]);
   const end = match[2] ? Number(match[2]) : fileSize - 1;
 
-  if (start >= fileSize || end >= fileSize) {
-    res.status(416).end();
-    return;
-  }
+  if (start >= fileSize || end >= fileSize) return res.status(416).end();
 
   const chunkSize = end - start + 1;
   res.status(206);
@@ -260,7 +258,7 @@ app.post("/render", async (req, res) => {
 
     const serve = await getBundle();
 
-    // 1) download sources to /tmp
+    // 1) download
     localVideo = path.join(os.tmpdir(), `in-video-${Date.now()}.mp4`);
     await downloadFromDrive(videoFileId, localVideo);
 
@@ -269,23 +267,22 @@ app.post("/render", async (req, res) => {
       await downloadFromDrive(musicFileId, localMusic);
     }
 
-    // 2) normalize iPhone/VFR/HDR → CFR 30 + H264 (убирает фризы/чёрные вспышки)
+    // 2) normalize (БЕЗ fps)
     localVideoNorm = path.join(os.tmpdir(), `in-video-norm-${Date.now()}.mp4`);
-    await normalizeVideo(localVideo, localVideoNorm);
+    await normalizeVideoNoFps(localVideo, localVideoNorm);
 
-    // 3) detect orientation (по нормализованному)
+    // 3) orientation
     const { w, h } = await getVideoDims(localVideoNorm);
-    const isHorizontal = w > h;
-    const fitMode = isHorizontal ? "contain" : "cover";
+    const fitMode = w > h ? "contain" : "cover";
 
-    // 4) serve local assets via HTTP
+    // 4) serve via HTTP
     token = registerAssets({ videoPath: localVideoNorm, musicPath: localMusic });
 
     const baseUrl = `http://127.0.0.1:${PORT}`;
     const videoUrl = `${baseUrl}/asset/${token}/video`;
     const musicUrl = localMusic ? `${baseUrl}/asset/${token}/music` : "";
 
-    // ✅ Передаем сразу все варианты, чтобы Short не ломался от названия
+    // ✅ Передаем сразу все варианты
     const inputProps = {
       hook: String(hook ?? ""),
       description: String(description ?? ""),
@@ -318,7 +315,6 @@ app.post("/render", async (req, res) => {
       },
       serveUrl: serve,
       codec: "h264",
-      // важно: чтобы итог тоже был совместимым и без сюрпризов
       pixelFormat: "yuv420p",
       outputLocation: outPath,
       inputProps,
@@ -326,7 +322,6 @@ app.post("/render", async (req, res) => {
 
     res.setHeader("Content-Type", "video/mp4");
     res.setHeader("Content-Disposition", `attachment; filename="short.mp4"`);
-
     fs.createReadStream(outPath).pipe(res);
 
     res.on("close", async () => {
