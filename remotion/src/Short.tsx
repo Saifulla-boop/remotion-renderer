@@ -1,4 +1,4 @@
-import { AbsoluteFill, Video, Audio } from "remotion";
+import { AbsoluteFill, Video, Audio, useVideoConfig } from "remotion";
 
 type Props = {
   hook?: string;
@@ -13,42 +13,48 @@ type Props = {
   musicUrl?: string;
   musicPath?: string;
   musicSrc?: string;
+
+  // опционально, если захочешь управлять
+  musicVolume?: number; // 0..1
+  videoVolume?: number; // 0..1
 };
 
 export const Short: React.FC<Props> = (props) => {
-  const {
-    hook = "",
-    description = "",
-  } = props;
+  const { width, height } = useVideoConfig();
 
-  // 🔥 выбираем первый валидный src
-  const videoSrc =
-    props.videoSrc ??
-    props.videoUrl ??
-    props.videoPath;
+  const hook = props.hook ?? "";
+  const description = props.description ?? "";
 
-  const musicSrc =
-    props.musicSrc ??
-    props.musicUrl ??
-    props.musicPath;
+  // Берём первый валидный src
+  const videoSrc = props.videoUrl ?? props.videoSrc ?? props.videoPath ?? "";
+  const musicSrc = props.musicUrl ?? props.musicSrc ?? props.musicPath ?? "";
 
   if (!videoSrc) {
-    throw new Error(
-      "Short.tsx: video src is undefined. Check server inputProps."
-    );
+    throw new Error("Short.tsx: video src is undefined. Check server inputProps.");
   }
+
+  // Громкости (чтобы голос не утопить в музыке)
+  const videoVolume = typeof props.videoVolume === "number" ? props.videoVolume : 1;
+  const musicVolume = typeof props.musicVolume === "number" ? props.musicVolume : 0.35;
 
   return (
     <AbsoluteFill style={{ backgroundColor: "black" }}>
-      {/* ВИДЕО — БЕЗ трансформаций */}
+      {/* ВИДЕО + ОРИГИНАЛЬНЫЙ ЗВУК */}
       <Video
         src={videoSrc}
-        startFrom={0}
-        endAt={undefined}
+        // важно: включаем звук видео
+        muted={false}
+        volume={videoVolume}
+        // чтобы не было растяжения/деформации
+        style={{
+          width,
+          height,
+          objectFit: "cover", // или "contain" если хочешь черные поля вместо кропа
+        }}
       />
 
-      {/* МУЗЫКА — опционально */}
-      {musicSrc ? <Audio src={musicSrc} /> : null}
+      {/* МУЗЫКА поверх (тише, чтобы не убить голос) */}
+      {musicSrc ? <Audio src={musicSrc} volume={musicVolume} /> : null}
 
       {/* ТЕКСТ */}
       <AbsoluteFill
@@ -57,6 +63,7 @@ export const Short: React.FC<Props> = (props) => {
           alignItems: "center",
           padding: 40,
           textAlign: "center",
+          pointerEvents: "none",
         }}
       >
         <div
