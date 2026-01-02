@@ -5,36 +5,48 @@ type Props = {
   hook: string;
   description?: string;
   durationSec?: number;
-  fitMode?: "cover" | "contain";
 
+  // поддержка всех вариантов
   videoUrl?: string;
-  videoPath?: string;
-  videoSrc?: string;
-
   musicUrl?: string;
+  videoPath?: string;
   musicPath?: string;
+  videoSrc?: string;
   musicSrc?: string;
+
+  fitMode?: "cover" | "contain";
 };
 
 export const Short: React.FC<Props> = (props) => {
-  const video = props.videoUrl || props.videoPath || props.videoSrc || "";
-  const music = props.musicUrl || props.musicPath || props.musicSrc || "";
-  const fitMode = props.fitMode || "cover";
+  const video =
+    props.videoPath || props.videoUrl || props.videoSrc || "";
+  const music =
+    props.musicPath || props.musicUrl || props.musicSrc || "";
 
   if (!video) throw new Error("No src passed (video is empty)");
+
+  const fit = props.fitMode ?? "cover";
 
   return (
     <AbsoluteFill style={{ backgroundColor: "black" }}>
       <AbsoluteFill>
         <Video
           src={video}
-          style={{ width: "100%", height: "100%", objectFit: fitMode }}
+          // 🔊 звук исходника (оставь 0.6 / сделай 0 если не нужен)
+          volume={0.6}
+          style={{ width: "100%", height: "100%", objectFit: fit }}
         />
       </AbsoluteFill>
 
       <AbsoluteFill style={{ backgroundColor: "rgba(0,0,0,0.35)" }} />
 
-      {music ? <Audio src={music} /> : null}
+      {music ? (
+        <Audio
+          src={music}
+          // 🔊 музыка тише
+          volume={0.8}
+        />
+      ) : null}
 
       <AbsoluteFill
         style={{
