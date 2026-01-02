@@ -114,6 +114,10 @@ app.post("/render", async (req, res) => {
     // ---- Скачиваем исходники
     const videoPath = await downloadToTmp({ fileId: videoFileId, ext: "mp4" });
     const musicPath = await downloadToTmp({ fileId: musicFileId, ext: "mp3" });
+    console.log("[render] downloaded sizes:", {
+  videoSize: fs.statSync(videoPath).size,
+  musicSize: fs.statSync(musicPath).size,
+});
 
     // ---- Находим композицию
     const comps =
