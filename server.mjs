@@ -14,9 +14,6 @@ const app = express();
 app.use(express.json({ limit: "10mb" }));
 
 const PORT = process.env.PORT || 3000;
-
-// ===== FPS =====
-// По умолчанию 30 (быстрее и стабильнее на Railway). Для 60: OUTPUT_FPS=60
 const OUTPUT_FPS = Number(process.env.OUTPUT_FPS || 30);
 const MIN_SEC = 6;
 const MAX_SEC = 30;
@@ -61,8 +58,8 @@ async function downloadFromDrive(fileId, outPath) {
   return outPath;
 }
 
-// -------------------- run ffmpeg/ffprobe --------------------
-function run(cmd, args, { timeoutMs = 180000 } = {}) {
+// -------------------- helpers --------------------
+function run(cmd, args, { timeoutMs = 8 * 60 * 1000 } = {}) {
   return new Promise((resolve, reject) => {
     const p = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"] });
 
@@ -103,57 +100,57 @@ async function getVideoDims(filePath) {
   return { w, h };
 }
 
-// ✅ Нормализация айфон-видео: VFR -> CFR + faststart (чтобы metadata была сразу)
-async function normalizeVideoToCfr(inputPath, fps = OUTPUT_FPS) {
-  const outPath = path.join(os.tmpdir(), `cfr-${Date.now()}.mp4`);
+// ✅ КЛЮЧ: нормализация айфон-видео → CFR 30 + H264 + yuv420p (убирает фризы и чёрные вспышки)
+async function normalizeVideo(inPath, outPath) {
+  // Важно: scale до чётных, fps фиксируем, формат делаем максимально совместимым.
+  // Это же часто убирает “black flashes” на HEVC/HDR.
+  await run("ffmpeg", [
+    "-y",
+    "-hide_banner",
+    "-loglevel",
+    "error",
 
-  await run(
-    "ffmpeg",
-    [
-      "-y",
-      "-i",
-      inputPath,
+    "-i",
+    inPath,
 
-      // делаем ровный FPS
-      "-vf",
-      `fps=${fps}`,
-      "-r",
-      String(fps),
+    // видео: CFR 30, чётные размеры, SDR-compatible пиксельный формат
+    "-vf",
+    `fps=${OUTPUT_FPS},scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p`,
 
-      // стабильный декод в Chromium
-      "-c:v",
-      "libx264",
-      "-preset",
-      "veryfast",
-      "-crf",
-      "18",
-      "-pix_fmt",
-      "yuv420p",
-      "-movflags",
-      "+faststart",
+    "-c:v",
+    "libx264",
+    "-pix_fmt",
+    "yuv420p",
+    "-profile:v",
+    "high",
+    "-preset",
+    "veryfast",
+    "-crf",
+    "18",
 
-      // звук выкидываем (музыка отдельной дорожкой)
-      "-an",
-      outPath,
-    ],
-    { timeoutMs: 240000 }
-  );
+    // audio: оставляем звук исходника, приводим к нормальному AAC
+    "-c:a",
+    "aac",
+    "-b:a",
+    "192k",
+    "-ar",
+    "48000",
 
-  const stat = fs.statSync(outPath);
-  if (!stat.size || stat.size < 1024) {
-    throw new Error(`normalizeVideoToCfr produced too small file (${stat.size})`);
-  }
+    // для корректной отдачи/чтения
+    "-movflags",
+    "+faststart",
 
+    outPath,
+  ]);
   return outPath;
 }
 
-// -------------------- Local assets served via HTTP (Chromium needs RANGE) --------------------
+// -------------------- Local assets served via HTTP (for Remotion/Chromium) --------------------
 const ASSETS = new Map(); // token -> { videoPath, musicPath?, expiresAt }
 
 function createToken() {
   return crypto.randomBytes(16).toString("hex");
 }
-
 function registerAssets({ videoPath, musicPath }) {
   const token = createToken();
   ASSETS.set(token, {
@@ -163,11 +160,9 @@ function registerAssets({ videoPath, musicPath }) {
   });
   return token;
 }
-
 function cleanupToken(token) {
   ASSETS.delete(token);
 }
-
 setInterval(() => {
   const now = Date.now();
   for (const [token, v] of ASSETS.entries()) {
@@ -175,8 +170,8 @@ setInterval(() => {
   }
 }, 2 * 60 * 1000);
 
-// ✅ Range helper (главное исправление)
-function serveWithRange(req, res, filePath, contentType) {
+// Range очень помогает, чтобы Chromium не “ждал” целиком файл
+function addRangeSupport(req, res, filePath, contentType) {
   const stat = fs.statSync(filePath);
   const fileSize = stat.size;
   const range = req.headers.range;
@@ -190,17 +185,16 @@ function serveWithRange(req, res, filePath, contentType) {
     return;
   }
 
-  // bytes=start-end
-  const match = String(range).match(/bytes=(\d+)-(\d*)/);
+  const match = /bytes=(\d+)-(\d*)/.exec(range);
   if (!match) {
     res.status(416).end();
     return;
   }
 
-  const start = parseInt(match[1], 10);
-  const end = match[2] ? parseInt(match[2], 10) : fileSize - 1;
+  const start = Number(match[1]);
+  const end = match[2] ? Number(match[2]) : fileSize - 1;
 
-  if (start >= fileSize || end >= fileSize || start > end) {
+  if (start >= fileSize || end >= fileSize) {
     res.status(416).end();
     return;
   }
@@ -216,18 +210,17 @@ function serveWithRange(req, res, filePath, contentType) {
 app.get("/asset/:token/video", (req, res) => {
   const entry = ASSETS.get(req.params.token);
   if (!entry?.videoPath) return res.status(404).send("Not found");
-  serveWithRange(req, res, entry.videoPath, "video/mp4");
+  addRangeSupport(req, res, entry.videoPath, "video/mp4");
 });
 
 app.get("/asset/:token/music", (req, res) => {
   const entry = ASSETS.get(req.params.token);
   if (!entry?.musicPath) return res.status(404).send("Not found");
-  serveWithRange(req, res, entry.musicPath, "audio/mpeg");
+  addRangeSupport(req, res, entry.musicPath, "audio/mpeg");
 });
 
 // -------------------- Remotion bundle cache --------------------
 let serveUrl = null;
-
 async function getBundle() {
   if (serveUrl) return serveUrl;
   serveUrl = await bundle({
@@ -241,21 +234,17 @@ app.get("/health", (_, res) => res.json({ ok: true }));
 
 app.post("/render", async (req, res) => {
   let localVideo = null;
+  let localVideoNorm = null;
   let localMusic = null;
-  let normalizedVideo = null;
   let outPath = null;
   let token = null;
 
   try {
     const body = req.body || {};
 
-    const hook = String(body.hook ?? "");
-    const description = String(body.description ?? "");
-    const durationSecRaw = body.durationSec;
-
-    const durationSec = Number.isFinite(Number(durationSecRaw))
-      ? Math.min(Math.max(Number(durationSecRaw), MIN_SEC), MAX_SEC)
-      : 12;
+    const hook = body.hook ?? "";
+    const description = body.description ?? "";
+    const durationSec = body.durationSec;
 
     const videoFileId =
       body.videoFileId ?? body.videoFieldId ?? body.videoFileid ?? body.videoFieldid;
@@ -265,9 +254,13 @@ app.post("/render", async (req, res) => {
 
     if (!videoFileId) return res.status(400).json({ error: "videoFileId required" });
 
+    const duration = Number.isFinite(Number(durationSec))
+      ? Math.min(Math.max(Number(durationSec), MIN_SEC), MAX_SEC)
+      : 12;
+
     const serve = await getBundle();
 
-    // 1) скачиваем
+    // 1) download sources to /tmp
     localVideo = path.join(os.tmpdir(), `in-video-${Date.now()}.mp4`);
     await downloadFromDrive(videoFileId, localVideo);
 
@@ -276,28 +269,27 @@ app.post("/render", async (req, res) => {
       await downloadFromDrive(musicFileId, localMusic);
     }
 
-    // 2) нормализуем (VFR -> CFR)
-    normalizedVideo = await normalizeVideoToCfr(localVideo, OUTPUT_FPS);
+    // 2) normalize iPhone/VFR/HDR → CFR 30 + H264 (убирает фризы/чёрные вспышки)
+    localVideoNorm = path.join(os.tmpdir(), `in-video-norm-${Date.now()}.mp4`);
+    await normalizeVideo(localVideo, localVideoNorm);
 
-    // 3) orientation
-    const { w, h } = await getVideoDims(normalizedVideo);
+    // 3) detect orientation (по нормализованному)
+    const { w, h } = await getVideoDims(localVideoNorm);
     const isHorizontal = w > h;
     const fitMode = isHorizontal ? "contain" : "cover";
 
-    console.log("VIDEO:", { w, h, isHorizontal, fitMode, OUTPUT_FPS });
-
-    // 4) ассеты по HTTP с Range
-    token = registerAssets({ videoPath: normalizedVideo, musicPath: localMusic });
+    // 4) serve local assets via HTTP
+    token = registerAssets({ videoPath: localVideoNorm, musicPath: localMusic });
 
     const baseUrl = `http://127.0.0.1:${PORT}`;
     const videoUrl = `${baseUrl}/asset/${token}/video`;
     const musicUrl = localMusic ? `${baseUrl}/asset/${token}/music` : "";
 
-    // 5) props под любые варианты Short.tsx
+    // ✅ Передаем сразу все варианты, чтобы Short не ломался от названия
     const inputProps = {
-      hook,
-      description,
-      durationSec,
+      hook: String(hook ?? ""),
+      description: String(description ?? ""),
+      durationSec: duration,
       fitMode,
 
       videoUrl,
@@ -322,29 +314,27 @@ app.post("/render", async (req, res) => {
       composition: {
         ...composition,
         fps: OUTPUT_FPS,
-        durationInFrames: Math.round(durationSec * OUTPUT_FPS),
+        durationInFrames: Math.round(duration * OUTPUT_FPS),
       },
       serveUrl: serve,
       codec: "h264",
+      // важно: чтобы итог тоже был совместимым и без сюрпризов
+      pixelFormat: "yuv420p",
       outputLocation: outPath,
       inputProps,
-
-      // таймаут увеличили, но теперь не должен упираться в delayRender
-      timeoutInMilliseconds: 240000,
     });
 
     res.setHeader("Content-Type", "video/mp4");
     res.setHeader("Content-Disposition", `attachment; filename="short.mp4"`);
 
-    const stream = fs.createReadStream(outPath);
-    stream.pipe(res);
+    fs.createReadStream(outPath).pipe(res);
 
-    stream.on("close", async () => {
+    res.on("close", async () => {
       try {
         if (token) cleanupToken(token);
         if (outPath) await fsp.unlink(outPath).catch(() => {});
         if (localVideo) await fsp.unlink(localVideo).catch(() => {});
-        if (normalizedVideo) await fsp.unlink(normalizedVideo).catch(() => {});
+        if (localVideoNorm) await fsp.unlink(localVideoNorm).catch(() => {});
         if (localMusic) await fsp.unlink(localMusic).catch(() => {});
       } catch {}
     });
@@ -356,12 +346,12 @@ app.post("/render", async (req, res) => {
       if (token) cleanupToken(token);
       if (outPath) await fsp.unlink(outPath).catch(() => {});
       if (localVideo) await fsp.unlink(localVideo).catch(() => {});
-      if (normalizedVideo) await fsp.unlink(normalizedVideo).catch(() => {});
+      if (localVideoNorm) await fsp.unlink(localVideoNorm).catch(() => {});
       if (localMusic) await fsp.unlink(localMusic).catch(() => {});
     } catch {}
   }
 });
 
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`Remotion renderer running on ${PORT}, OUTPUT_FPS=${OUTPUT_FPS}`);
+  console.log(`Remotion renderer running on ${PORT} (OUTPUT_FPS=${OUTPUT_FPS})`);
 });
