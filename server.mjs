@@ -5,7 +5,6 @@ import os from "os";
 import { fileURLToPath } from "url";
 import { Readable } from "stream";
 import { pipeline } from "stream/promises";
-import { spawn } from "child_process";
 
 import { bundle } from "@remotion/bundler";
 import { getCompositions, renderMedia } from "@remotion/renderer";
@@ -14,96 +13,61 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
-app.use(express.json({ limit: "10mb" }));
+app.use(express.json({ limit: "20mb" }));
 
 // ========= CONFIG =========
 const REMOTION_ROOT = path.join(__dirname, "remotion");
 const REMOTION_ENTRY = path.join(REMOTION_ROOT, "src", "index.ts");
 const COMPOSITION_ID = process.env.COMPOSITION_ID || "Short";
 
-// Google Drive public download URL
+const cleanId = (s) => String(s || "").replace(/^=+/, "").trim();
+
 const driveDownloadUrl = (fileId) =>
   `https://drive.google.com/uc?export=download&id=${encodeURIComponent(fileId)}`;
 
-const cleanId = (s) => String(s || "").replace(/^=+/, "").trim();
-
 /**
- * Скачиваем файл во временную папку (Node18 fetch -> WebStream)
+ * downloadToTmp()
+ * Скачивает файл из Google Drive по публичному fileId в /tmp и возвращает путь.
+ * Важно: Drive иногда отдаёт HTML вместо файла (если нет публичного доступа).
+ * Мы это детектим и кидаем понятную ошибку.
  */
 async function downloadToTmp({ fileId, ext }) {
   const safeId = cleanId(fileId);
   if (!safeId) throw new Error("downloadToTmp: fileId is empty");
 
   const url = driveDownloadUrl(safeId);
-  const res = await fetch(url, { redirect: "follow" });
 
-  if (!res.ok) throw new Error(`Drive download failed (${res.status})`);
-  if (!res.body) throw new Error("Download failed: empty body");
+  const res = await fetch(url, { redirect: "follow" });
+  if (!res.ok) {
+    throw new Error(`Drive download failed (${res.status}). fileId=${safeId}`);
+  }
+  if (!res.body) {
+    throw new Error(`Drive download failed: empty body. fileId=${safeId}`);
+  }
 
   const tmpPath = path.join(os.tmpdir(), `${Date.now()}-${safeId}.${ext}`);
   const fileStream = fs.createWriteStream(tmpPath);
 
+  // Node18 fetch -> WebStream -> convert:
   await pipeline(Readable.fromWeb(res.body), fileStream);
 
   const stat = fs.statSync(tmpPath);
   if (!stat.size || stat.size < 1024) {
     throw new Error(
-      `Downloaded file looks wrong (size=${stat.size}). Drive probably returned HTML instead of a file. fileId=${safeId}`
+      `Downloaded file looks wrong (size=${stat.size}). Probably Drive returned HTML. fileId=${safeId}`
+    );
+  }
+
+  // 🔥 Жёсткая проверка: не HTML ли это
+  const headBuf = fs.readFileSync(tmpPath);
+  const headText = headBuf.slice(0, 800).toString("utf8").toLowerCase();
+  if (headText.includes("<html") || headText.includes("<!doctype")) {
+    throw new Error(
+      `Drive returned HTML instead of media. Make file public ("Anyone with link"). fileId=${safeId}`
     );
   }
 
   return tmpPath;
-}
-
-/**
- * Запуск ffmpeg командой. Remotion всё равно требует ffmpeg для renderMedia,
- * поэтому в Railway он должен быть доступен. Если нет — покажет ошибку в логах.
- */
-function run(cmd, args) {
-  return new Promise((resolve, reject) => {
-    const p = spawn(cmd, args, { stdio: "inherit" });
-    p.on("error", reject);
-    p.on("close", (code) => {
-      if (code === 0) resolve();
-      else reject(new Error(`${cmd} exited with code ${code}`));
-    });
-  });
-}
-
-/**
- * Приводим видео к формату, который 100% ест Chromium:
- * MP4 + H264 + AAC + yuv420p + faststart
- */
-async function ensureBrowserMp4(inputPath) {
-  const outPath = path.join(os.tmpdir(), `vid-ok-${Date.now()}.mp4`);
-
-  await run("ffmpeg", [
-    "-y",
-    "-i",
-    inputPath,
-    "-vf",
-    "format=yuv420p",
-    "-c:v",
-    "libx264",
-    "-preset",
-    "veryfast",
-    "-crf",
-    "22",
-    "-movflags",
-    "+faststart",
-    "-c:a",
-    "aac",
-    "-b:a",
-    "128k",
-    outPath,
-  ]);
-
-  const stat = fs.statSync(outPath);
-  if (!stat.size || stat.size < 1024) {
-    throw new Error("FFmpeg produced empty output video");
-  }
-
-  return outPath;
 }
 
 let bundleLocation = null;
@@ -125,12 +89,13 @@ async function prepareRemotion() {
   );
 }
 
-app.get("/health", (req, res) => {
-  res.json({ ok: true });
-});
+app.get("/health", (req, res) => res.json({ ok: true }));
 
 app.post("/render", async (req, res) => {
-  // Важно: тут НЕ меняй — это твоя совместимость videoFileId / videoFieldId
+  let videoPath = null;
+  let musicPath = null;
+  let outPath = null;
+
   try {
     const body = req.body || {};
 
@@ -138,17 +103,23 @@ app.post("/render", async (req, res) => {
     const description = body.description ?? "";
     const durationSec = body.durationSec;
 
+    // ✅ поддержка обоих вариантов
     const videoFileId =
-      body.videoFileId ?? body.videoFieldId ?? body.videoFileid;
+      body.videoFileId ?? body.videoFieldId ?? body.videoFileid ?? body.videoFieldid;
     const musicFileId =
-      body.musicFileId ?? body.musicFieldId ?? body.musicFileid;
+      body.musicFileId ?? body.musicFieldId ?? body.musicFileid ?? body.musicFieldid;
+
+    // (опционально) имена, чтобы правильно выбрать расширение
+    const videoName = body.videoName ?? "";
+    const musicName = body.musicName ?? "";
 
     // ---- Валидация
-    if (!hook || typeof hook !== "string")
+    if (!hook || typeof hook !== "string") {
       throw new Error("hook is missing (string required)");
-    if (typeof description !== "string")
+    }
+    if (typeof description !== "string") {
       throw new Error("description must be a string");
-
+    }
     if (!videoFileId || typeof videoFileId !== "string") {
       throw new Error("videoFileId (or videoFieldId) is missing (string required)");
     }
@@ -157,25 +128,32 @@ app.post("/render", async (req, res) => {
     }
 
     const dur = Number(durationSec ?? 12);
-    if (!Number.isFinite(dur) || dur <= 0)
+    if (!Number.isFinite(dur) || dur <= 0) {
       throw new Error("durationSec must be a positive number");
+    }
+
+    // ---- Расширения (если пришли имена)
+    const videoExtFromName = path.extname(videoName).replace(".", "").toLowerCase();
+    const musicExtFromName = path.extname(musicName).replace(".", "").toLowerCase();
+
+    const videoExt = videoExtFromName || "mp4";
+    const musicExt = musicExtFromName || "mp3";
 
     console.log("[render] incoming:", {
       hookLen: hook.length,
       descriptionLen: description.length,
+      durationSec: dur,
       videoFileId: cleanId(videoFileId),
       musicFileId: cleanId(musicFileId),
-      durationSec: dur,
+      videoName,
+      musicName,
+      videoExt,
+      musicExt,
     });
 
-    // ---- Скачиваем исходники (видео может быть .MOV/HEVC — это ок)
-    const rawVideoPath = await downloadToTmp({ fileId: videoFileId, ext: "mov" });
-    const rawMusicPath = await downloadToTmp({ fileId: musicFileId, ext: "mp3" });
-
-    // ---- Конвертируем видео в mp4/h264 чтобы Remotion/Chromium не падал
-    console.log("[render] ffmpeg convert to browser mp4...");
-    const videoPath = await ensureBrowserMp4(rawVideoPath);
-    const musicPath = rawMusicPath;
+    // ---- Скачиваем исходники
+    videoPath = await downloadToTmp({ fileId: videoFileId, ext: videoExt });
+    musicPath = await downloadToTmp({ fileId: musicFileId, ext: musicExt });
 
     // ---- Находим композицию
     const comps =
@@ -190,9 +168,9 @@ app.post("/render", async (req, res) => {
       );
     }
 
-    // ---- Рендерим
-    const outPath = path.join(os.tmpdir(), `render-${Date.now()}.mp4`);
+    outPath = path.join(os.tmpdir(), `render-${Date.now()}.mp4`);
 
+    // ---- inputProps для Short.tsx
     const inputProps = {
       hook,
       description,
@@ -201,7 +179,16 @@ app.post("/render", async (req, res) => {
       musicPath,
     };
 
-    console.log("[render] inputProps:", inputProps);
+    console.log("[render] inputProps:", {
+      durationSec: inputProps.durationSec,
+      videoPath: inputProps.videoPath,
+      musicPath: inputProps.musicPath,
+    });
+
+    const chromiumPath =
+      process.env.PUPPETEER_EXECUTABLE_PATH ||
+      process.env.CHROME_BIN ||
+      "/usr/bin/chromium";
 
     await renderMedia({
       composition: comp,
@@ -209,24 +196,45 @@ app.post("/render", async (req, res) => {
       codec: "h264",
       outputLocation: outPath,
       inputProps,
+      chromiumOptions: {
+        executablePath: chromiumPath,
+        args: [
+          "--no-sandbox",
+          "--disable-setuid-sandbox",
+          "--autoplay-policy=no-user-gesture-required",
+          "--disable-web-security",
+          "--allow-file-access-from-files",
+        ],
+      },
     });
 
-    // ---- Отдаем видео
+    // ---- Отдаем видео бинарём
     res.setHeader("Content-Type", "video/mp4");
     res.setHeader("Content-Disposition", `attachment; filename="short.mp4"`);
 
-    const stream = fs.createReadStream(outPath);
-    stream.pipe(res);
+    fs.createReadStream(outPath).pipe(res);
 
-    stream.on("close", () => {
-      // cleanup
-      for (const p of [outPath, rawVideoPath, videoPath, rawMusicPath]) {
-        try { fs.unlinkSync(p); } catch {}
-      }
+    res.on("close", () => {
+      try { if (outPath) fs.unlinkSync(outPath); } catch {}
+      try { if (videoPath) fs.unlinkSync(videoPath); } catch {}
+      try { if (musicPath) fs.unlinkSync(musicPath); } catch {}
     });
   } catch (e) {
     console.error("[render] error:", e);
-    res.status(400).json({ ok: false, error: String(e?.message || e) });
+    try {
+      if (outPath) fs.unlinkSync(outPath);
+    } catch {}
+    try {
+      if (videoPath) fs.unlinkSync(videoPath);
+    } catch {}
+    try {
+      if (musicPath) fs.unlinkSync(musicPath);
+    } catch {}
+
+    res.status(400).json({
+      ok: false,
+      error: String(e?.message || e),
+    });
   }
 });
 
