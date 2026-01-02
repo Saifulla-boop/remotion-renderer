@@ -308,18 +308,35 @@ app.post("/render", async (req, res) => {
     outPath = path.join(os.tmpdir(), `out-${Date.now()}.mp4`);
 
     await renderMedia({
-      composition: {
-        ...composition,
-        fps: OUTPUT_FPS,
-        durationInFrames: Math.round(duration * OUTPUT_FPS),
-      },
-      serveUrl: serve,
-      codec: "h264",
-      pixelFormat: "yuv420p",
-      outputLocation: outPath,
-      inputProps,
-    });
+  composition: {
+    ...composition,
+    fps: OUTPUT_FPS,
+    durationInFrames: Math.round(duration * OUTPUT_FPS),
+  },
+  serveUrl: serve,
 
+  codec: "h264",
+  pixelFormat: "yuv420p",
+  outputLocation: outPath,
+  inputProps,
+
+  // ✅ Таймауты (в миллисекундах)
+  timeoutInMilliseconds: 10 * 60 * 1000,            // 10 минут на весь процесс
+  delayRenderTimeoutInMilliseconds: 5 * 60 * 1000,  // 5 минут на delayRender()
+
+  // ✅ Стабильность Chromium в контейнере
+  chromiumOptions: {
+    args: [
+      "--no-sandbox",
+      "--disable-setuid-sandbox",
+      "--disable-dev-shm-usage",
+    ],
+  },
+
+  // ✅ Меньше нагрузка на CPU (если не нужно параллелить)
+  concurrency: 1,
+});
+    
     res.setHeader("Content-Type", "video/mp4");
     res.setHeader("Content-Disposition", `attachment; filename="short.mp4"`);
     fs.createReadStream(outPath).pipe(res);
