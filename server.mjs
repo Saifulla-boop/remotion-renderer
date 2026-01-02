@@ -25,28 +25,32 @@ const MIN_SEC = 6;
 const MAX_SEC = 30;
 
 // Ускорение рендера
-// Railway часто дает 2 vCPU — поэтому по умолчанию 2, но можно поднять env’ом.
 const RENDER_CONCURRENCY = Number(process.env.RENDER_CONCURRENCY || 2);
-
-// Размер кэша для offthread video (чтобы меньше дергать диск/декодер)
 const OFFTHREAD_CACHE_MB = Number(process.env.OFFTHREAD_CACHE_MB || 512);
 
-// Конвертация “для Chromium”
+// Шаг 2: минимальная конвертация “для Chromium”
 const ENABLE_CHROMIUM_FIX = (process.env.ENABLE_CHROMIUM_FIX ?? "1") !== "0";
 
 // -------------------- helpers --------------------
 function nowIso() {
   return new Date().toISOString();
 }
+
 function safeStr(x) {
   return typeof x === "string" ? x : "";
 }
+
 function newJobId() {
-  return crypto.randomUUID ? crypto.randomUUID() : crypto.randomBytes(16).toString("hex");
+  return crypto.randomUUID
+    ? crypto.randomUUID()
+    : crypto.randomBytes(16).toString("hex");
 }
-function run(cmd, args, { timeoutMs } = {}) {
+
+// Один-единственный runner для команд (ffmpeg/ffprobe)
+function runCmd(cmd, args, { timeoutMs } = {}) {
   return new Promise((resolve, reject) => {
     const p = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"] });
+
     let out = "";
     let err = "";
 
@@ -69,7 +73,7 @@ function run(cmd, args, { timeoutMs } = {}) {
     p.on("close", (code) => {
       if (timer) clearTimeout(timer);
       if (code === 0) return resolve({ out, err });
-      reject(new Error(`${cmd} exited ${code}\n${err || out}`));
+      reject(new Error(`${cmd} exited ${code}\n${(err || out).slice(-4000)}`));
     });
   });
 }
@@ -121,6 +125,7 @@ const ASSETS = new Map(); // token -> { videoPath, musicPath?, expiresAt }
 function createToken() {
   return crypto.randomBytes(16).toString("hex");
 }
+
 function registerAssets({ videoPath, musicPath }) {
   const token = createToken();
   ASSETS.set(token, {
@@ -130,9 +135,11 @@ function registerAssets({ videoPath, musicPath }) {
   });
   return token;
 }
+
 function cleanupToken(token) {
   ASSETS.delete(token);
 }
+
 setInterval(() => {
   const now = Date.now();
   for (const [token, v] of ASSETS.entries()) {
@@ -195,13 +202,9 @@ async function getBundle() {
   return serveUrl;
 }
 
-// -------------------- Minimal “fix for Chromium” --------------------
-// Идея: если файл уже mp4+h264+yuv420p(+aac) — НЕ трогаем.
-// Если нет — быстро перекодируем в h264/yuv420p + faststart.
-// Это убирает “Code 4” и “progress=0”.
+// -------------------- STEP 2: Minimal “fix for Chromium” --------------------
 async function probeVideo(filePath) {
-  // выдаст JSON с потоками/форматом
-  const { out } = await run("ffprobe", [
+  const { out } = await runCmd("ffprobe", [
     "-v",
     "error",
     "-print_format",
@@ -220,27 +223,36 @@ function isChromiumFriendly(info) {
   const fmt = info?.format?.format_name || "";
 
   // контейнер
-  const containerOk = fmt.includes("mp4") || fmt.includes("mov,mp4,m4a,3gp,3g2,mj2");
+  const containerOk =
+    fmt.includes("mp4") || fmt.includes("mov,mp4,m4a,3gp,3g2,mj2");
 
   // видео кодек
   const vCodecOk = v?.codec_name === "h264";
-  // пиксельный формат (самая частая проблема: yuv422p / yuv444p с айфона)
+
+  // ключевое: пикс формат (айфон любит yuv422p / yuv444p => микрофризы/ошибки)
   const pixOk = (v?.pix_fmt || "").includes("yuv420p");
 
-  // аудио не всегда обязателен, но если есть — лучше aac
+  // аудио ок (если есть)
   const aOk = !a || a.codec_name === "aac" || a.codec_name === "mp3";
 
   return containerOk && vCodecOk && pixOk && aOk;
 }
 
+/**
+ * ШАГ 2: трогаем файл только если НЕ chromium-friendly.
+ * Конвертируем быстро (veryfast), делаем yuv420p + faststart.
+ */
 async function ensureVideoForChromium(inputPath, jobId) {
   if (!ENABLE_CHROMIUM_FIX) return inputPath;
 
-  let info;
+  let info = null;
   try {
     info = await probeVideo(inputPath);
   } catch (e) {
-    console.log(`[job ${jobId}] ffprobe failed, will convert anyway:`, String(e?.message || e));
+    console.log(
+      `[job ${jobId}] ffprobe failed, will convert anyway:`,
+      String(e?.message || e)
+    );
   }
 
   if (info && isChromiumFriendly(info)) {
@@ -252,15 +264,21 @@ async function ensureVideoForChromium(inputPath, jobId) {
 
   console.log(`[job ${jobId}] converting video for chromium -> ${path.basename(outPath)}`);
 
-  // ВАЖНО: preset veryfast — быстрее, чем “качество”
-  // movflags +faststart — чтобы mp4 нормально стримился/читался
-  // pix_fmt yuv420p — must-have для Chrome
-  await run(
+  await runCmd(
     "ffmpeg",
     [
       "-y",
       "-i",
       inputPath,
+
+      // делаем предсказуемый CFR под FPS проекта
+      "-vf",
+      `fps=${OUTPUT_FPS}`,
+      "-r",
+      String(OUTPUT_FPS),
+      "-vsync",
+      "cfr",
+
       "-c:v",
       "libx264",
       "-preset",
@@ -271,10 +289,14 @@ async function ensureVideoForChromium(inputPath, jobId) {
       "yuv420p",
       "-movflags",
       "+faststart",
+
       "-c:a",
       "aac",
       "-b:a",
       "128k",
+      "-ar",
+      "48000",
+
       outPath,
     ],
     { timeoutMs: 10 * 60 * 1000 }
@@ -302,7 +324,9 @@ async function cleanupOldJobs() {
       if (job.assetToken) cleanupToken(job.assetToken);
       if (job.outPath) await fsp.unlink(job.outPath).catch(() => {});
       if (job.localVideo) await fsp.unlink(job.localVideo).catch(() => {});
-      if (job.localVideoFixed) await fsp.unlink(job.localVideoFixed).catch(() => {});
+      if (job.localVideoFixed && job.localVideoFixed !== job.localVideo) {
+        await fsp.unlink(job.localVideoFixed).catch(() => {});
+      }
       if (job.localMusic) await fsp.unlink(job.localMusic).catch(() => {});
     } catch {}
 
@@ -330,9 +354,8 @@ async function processJob(jobId) {
   try {
     const serve = await getBundle();
 
-    // 1) download sources
-    const localVideoRaw = path.join(os.tmpdir(), `job-${jobId}-video`);
-    const localVideoPath = localVideoRaw + ".bin";
+    // 1) download sources (важно: даём норм расширение)
+    const localVideoPath = path.join(os.tmpdir(), `job-${jobId}-video-source.mp4`);
     await downloadFromDrive(job.payload.videoFileId, localVideoPath);
 
     let localMusic = null;
@@ -344,11 +367,11 @@ async function processJob(jobId) {
     job.localVideo = localVideoPath;
     job.localMusic = localMusic;
 
-    // 2) minimal chromium fix (конвертация только если нужно)
+    // 2) STEP 2: minimal chromium fix (конвертация только если нужно)
     const localVideoFixed = await ensureVideoForChromium(localVideoPath, jobId);
     job.localVideoFixed = localVideoFixed;
 
-    // 3) register local assets and create URLs for Chromium
+    // 3) register assets
     const assetToken = registerAssets({
       videoPath: localVideoFixed,
       musicPath: localMusic,
@@ -391,7 +414,7 @@ async function processJob(jobId) {
 
     const durationInFrames = Math.round(job.payload.durationSec * OUTPUT_FPS);
 
-    // 7) render (ускоренная конфигурация)
+    // 7) render
     let lastLog = 0;
 
     await renderMedia({
@@ -406,7 +429,6 @@ async function processJob(jobId) {
       outputLocation: outPath,
       inputProps,
 
-      // Хромиум в контейнере
       chromiumOptions: {
         args: [
           "--no-sandbox",
@@ -414,17 +436,13 @@ async function processJob(jobId) {
           "--disable-dev-shm-usage",
           "--disable-gpu",
           "--no-zygote",
-          "--single-process",
         ],
       },
 
-      // Вот тут скорость:
+      // скорость
       concurrency: Math.max(1, Math.min(RENDER_CONCURRENCY, os.cpus().length)),
-
-      // Кэш видео (часто сильно помогает)
       offthreadVideoCacheSizeInBytes: OFFTHREAD_CACHE_MB * 1024 * 1024,
 
-      // таймауты
       timeoutInMilliseconds: 30 * 60 * 1000,
       delayRenderTimeoutInMilliseconds: 10 * 60 * 1000,
 
@@ -456,7 +474,9 @@ async function processJob(jobId) {
     job.progress = 1;
     job.updatedAtIso = nowIso();
 
-    console.log(`[job ${jobId}] done in ${Math.round((job.finishedAt - job.startedAt) / 1000)}s`);
+    console.log(
+      `[job ${jobId}] done in ${Math.round((job.finishedAt - job.startedAt) / 1000)}s`
+    );
   } catch (e) {
     job.status = "error";
     job.error = String(e?.message || e);
