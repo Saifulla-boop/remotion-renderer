@@ -1,58 +1,57 @@
 import React from "react";
-import {
-  AbsoluteFill,
-  Audio,
-  Video,
-} from "remotion";
+import { AbsoluteFill, Audio, Video } from "remotion";
 
 type Props = {
   hook: string;
   description?: string;
   durationSec?: number;
-  videoPath: string; // важно: именно videoPath
-  musicPath: string; // важно: именно musicPath
+
+  // новые
+  videoPath?: string;
+  musicPath?: string;
+
+  // старые
+  videoSrc?: string;
+  musicSrc?: string;
 };
 
-export const Short: React.FC<Props> = ({
-  hook,
-  videoPath,
-  musicPath,
-}) => {
-  // Явная, понятная ошибка (чтобы сразу видеть, что именно пустое)
-  if (!videoPath || typeof videoPath !== "string") {
+export const Short: React.FC<Props> = (props) => {
+  const hook = props.hook ?? "";
+
+  // ✅ берём сначала новые, если их нет — старые
+  const video = props.videoPath ?? props.videoSrc ?? "";
+  const music = props.musicPath ?? props.musicSrc ?? "";
+
+  if (!video || typeof video !== "string") {
     throw new Error("No src passed (videoPath is empty)");
   }
-  if (!musicPath || typeof musicPath !== "string") {
+  if (!music || typeof music !== "string") {
     throw new Error("No src passed (musicPath is empty)");
   }
 
   return (
     <AbsoluteFill style={{ backgroundColor: "black" }}>
-      {/* Видео */}
       <AbsoluteFill>
         <Video
-          src={videoPath}
+          src={video}
           style={{ width: "100%", height: "100%", objectFit: "cover" }}
         />
       </AbsoluteFill>
 
-      {/* Притемнение как в рефе */}
       <AbsoluteFill style={{ backgroundColor: "rgba(0,0,0,0.35)" }} />
 
-      {/* Музыка */}
-      <Audio src={musicPath} />
+      <Audio src={music} />
 
-      {/* Подложка + текст (нижняя треть, по центру) */}
       <AbsoluteFill
         style={{
           justifyContent: "flex-end",
           alignItems: "center",
-          paddingBottom: 260, // можно чуть двигать вверх/вниз под реф
+          paddingBottom: 260,
         }}
       >
         <div
           style={{
-            backgroundColor: "rgba(176, 92, 30, 0.80)", // оранжевый как на рефе
+            backgroundColor: "rgba(176, 92, 30, 0.80)",
             borderRadius: 28,
             padding: "28px 34px",
             maxWidth: 920,
