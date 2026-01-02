@@ -2,65 +2,78 @@ import React from "react";
 import {
   AbsoluteFill,
   Audio,
-  OffthreadVideo,
-  interpolate,
-  useCurrentFrame,
+  Video,
   useVideoConfig,
 } from "remotion";
 
 type Props = {
   hook: string;
   description: string;
-  durationSec: number;
-  videoPath: string;   // <-- КЛЮЧЕВО
-  musicPath: string;   // <-- КЛЮЧЕВО
+  durationSec?: number;
+  videoPath: string; // <-- важно
+  musicPath: string; // <-- важно
 };
 
-export const Short: React.FC<Props> = ({
-  hook,
-  description,
-  durationSec,
-  videoPath,
-  musicPath,
-}) => {
-  const frame = useCurrentFrame();
-  const { fps } = useVideoConfig();
+export const Short: React.FC<Props> = (props) => {
+  const { hook, description, videoPath, musicPath } = props;
+  const { width, height } = useVideoConfig();
 
-  if (!videoPath) {
-    throw new Error("No src passed (videoPath is empty)");
+  if (!videoPath || typeof videoPath !== "string") {
+    throw new Error(`No src passed (videoPath is empty)`);
+  }
+  if (!musicPath || typeof musicPath !== "string") {
+    throw new Error(`No src passed (musicPath is empty)`);
   }
 
-  // лёгкий fade-in
-  const opacity = interpolate(frame, [0, 15], [0, 1], { extrapolateRight: "clamp" });
-
   return (
-    <AbsoluteFill>
-      <OffthreadVideo src={videoPath} />
+    <AbsoluteFill style={{ backgroundColor: "black" }}>
+      {/* Видео */}
+      <Video
+        src={videoPath}
+        style={{ width, height, objectFit: "cover" }}
+      />
 
-      <AbsoluteFill style={{ backgroundColor: "rgba(0,0,0,0.15)" }} />
+      {/* Музыка */}
+      <Audio src={musicPath} />
 
-      <AbsoluteFill style={{ justifyContent: "center", alignItems: "center" }}>
+      {/* Текст — пока базово, позже доведем до референса */}
+      <AbsoluteFill
+        style={{
+          justifyContent: "center",
+          alignItems: "center",
+          padding: 80,
+        }}
+      >
         <div
           style={{
-            opacity,
             maxWidth: 900,
-            padding: "28px 34px",
-            borderRadius: 18,
-            background: "rgba(0,0,0,0.45)",
-            color: "white",
-            fontSize: 64,
-            fontWeight: 600,
+            fontSize: 54,
             lineHeight: 1.15,
+            color: "white",
+            fontWeight: 600,
             textAlign: "center",
-            fontFamily: "Arial",
-            whiteSpace: "pre-wrap",
+            background: "rgba(0,0,0,0.35)",
+            padding: "22px 28px",
+            borderRadius: 18,
           }}
         >
           {hook}
         </div>
-      </AbsoluteFill>
 
-      {musicPath ? <Audio src={musicPath} /> : null}
+        <div
+          style={{
+            marginTop: 22,
+            maxWidth: 980,
+            fontSize: 34,
+            lineHeight: 1.25,
+            color: "rgba(255,255,255,0.9)",
+            textAlign: "center",
+            textShadow: "0 2px 10px rgba(0,0,0,0.4)",
+          }}
+        >
+          {description}
+        </div>
+      </AbsoluteFill>
     </AbsoluteFill>
   );
 };
