@@ -11,7 +11,7 @@ import { renderMedia, selectComposition } from "@remotion/renderer";
 import { google } from "googleapis";
 
 const app = express();
-app.use(express.json({ limit: "5mb" }));
+app.use(express.json({ limit: "10mb" }));
 
 const PORT = process.env.PORT || 3000;
 
@@ -37,7 +37,6 @@ function getDrive() {
 
 async function downloadFromDrive(fileId, outPath) {
   const drive = getDrive();
-
   const res = await drive.files.get(
     { fileId, alt: "media" },
     { responseType: "stream" }
@@ -48,10 +47,15 @@ async function downloadFromDrive(fileId, outPath) {
     res.data.on("end", resolve).on("error", reject).pipe(dest);
   });
 
+  const stat = fs.statSync(outPath);
+  if (!stat.size || stat.size < 1024) {
+    throw new Error(`Downloaded file too small (${stat.size}). fileId=${fileId}`);
+  }
+
   return outPath;
 }
 
-// -------------------- Local assets served via HTTP (for OffthreadVideo) --------------------
+// -------------------- Local assets served via HTTP (for Remotion/Chromium) --------------------
 const ASSETS = new Map(); // token -> { videoPath, musicPath?, expiresAt }
 
 function createToken() {
@@ -156,12 +160,20 @@ app.post("/render", async (req, res) => {
   let token = null;
 
   try {
-    const { hook, videoFileId, musicFileId, durationSec, textPosition } =
-      req.body || {};
+    const body = req.body || {};
 
-    if (!videoFileId) {
-      return res.status(400).json({ error: "videoFileId required" });
-    }
+    // ✅ поддержка разных имен входных полей
+    const hook = body.hook ?? "";
+    const description = body.description ?? "";
+    const durationSec = body.durationSec;
+
+    const videoFileId =
+      body.videoFileId ?? body.videoFieldId ?? body.videoFileid ?? body.videoFieldid;
+
+    const musicFileId =
+      body.musicFileId ?? body.musicFieldId ?? body.musicFileid ?? body.musicFieldid;
+
+    if (!videoFileId) return res.status(400).json({ error: "videoFileId required" });
 
     const duration = Number.isFinite(Number(durationSec))
       ? Math.min(Math.max(Number(durationSec), 6), 30)
@@ -181,25 +193,34 @@ app.post("/render", async (req, res) => {
     // 2) detect orientation
     const { w, h } = await getVideoDims(localVideo);
     const isHorizontal = w > h;
-
-    // горизонтальные — CONTAIN (как фото 2)
-    // вертикальные — COVER (как обычный рилс)
     const fitMode = isHorizontal ? "contain" : "cover";
+
     console.log("VIDEO_DIMS:", { w, h, isHorizontal, fitMode });
 
     // 3) serve local assets via HTTP
     token = registerAssets({ videoPath: localVideo, musicPath: localMusic });
+
     const baseUrl = `http://127.0.0.1:${PORT}`;
     const videoUrl = `${baseUrl}/asset/${token}/video`;
     const musicUrl = localMusic ? `${baseUrl}/asset/${token}/music` : "";
 
+    // ✅ КЛЮЧЕВОЕ: передаем сразу ВСЕ варианты названий пропсов
     const inputProps = {
       hook: String(hook ?? ""),
+      description: String(description ?? ""),
+      durationSec: duration,
+      fitMode,
+
+      // старый вариант
       videoUrl,
       musicUrl,
-      durationSec: duration,
-      textPosition: textPosition || "auto",
-      fitMode, // <-- ВАЖНО
+
+      // новые варианты (на будущее)
+      videoPath: videoUrl,
+      musicPath: musicUrl,
+
+      videoSrc: videoUrl,
+      musicSrc: musicUrl,
     };
 
     const composition = await selectComposition({
@@ -238,16 +259,17 @@ app.post("/render", async (req, res) => {
     });
   } catch (e) {
     console.error(e);
-    if (!res.headersSent) {
-      res.status(500).json({ error: e?.message || "Render failed" });
-    }
-    if (token) cleanupToken(token);
-    if (outPath) await fsp.unlink(outPath).catch(() => {});
-    if (localVideo) await fsp.unlink(localVideo).catch(() => {});
-    if (localMusic) await fsp.unlink(localMusic).catch(() => {});
+    if (!res.headersSent) res.status(500).json({ error: e?.message || "Render failed" });
+
+    try {
+      if (token) cleanupToken(token);
+      if (outPath) await fsp.unlink(outPath).catch(() => {});
+      if (localVideo) await fsp.unlink(localVideo).catch(() => {});
+      if (localMusic) await fsp.unlink(localMusic).catch(() => {});
+    } catch {}
   }
 });
 
-app.listen(PORT, () => {
+app.listen(PORT, "0.0.0.0", () => {
   console.log(`Remotion renderer running on ${PORT}`);
 });
