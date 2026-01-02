@@ -222,17 +222,11 @@ function isChromiumFriendly(info) {
   const a = streams.find((s) => s.codec_type === "audio");
   const fmt = info?.format?.format_name || "";
 
-  // контейнер
   const containerOk =
     fmt.includes("mp4") || fmt.includes("mov,mp4,m4a,3gp,3g2,mj2");
 
-  // видео кодек
   const vCodecOk = v?.codec_name === "h264";
-
-  // ключевое: пикс формат (айфон любит yuv422p / yuv444p => микрофризы/ошибки)
   const pixOk = (v?.pix_fmt || "").includes("yuv420p");
-
-  // аудио ок (если есть)
   const aOk = !a || a.codec_name === "aac" || a.codec_name === "mp3";
 
   return containerOk && vCodecOk && pixOk && aOk;
@@ -240,7 +234,9 @@ function isChromiumFriendly(info) {
 
 /**
  * ШАГ 2: трогаем файл только если НЕ chromium-friendly.
- * Конвертируем быстро (veryfast), делаем yuv420p + faststart.
+ * Конвертация с флагами, которые лечат iPhone MOV (edit list / pts):
+ * -ignore_editlist 1, +genpts, make_zero, timescale
+ * CFR под OUTPUT_FPS (лучше ставить OUTPUT_FPS=60 для айфона)
  */
 async function ensureVideoForChromium(inputPath, jobId) {
   if (!ENABLE_CHROMIUM_FIX) return inputPath;
@@ -261,45 +257,61 @@ async function ensureVideoForChromium(inputPath, jobId) {
   }
 
   const outPath = inputPath.replace(/\.[^.]+$/, "") + `-chromium.mp4`;
-
-  console.log(`[job ${jobId}] converting video for chromium -> ${path.basename(outPath)}`);
+  console.log(
+    `[job ${jobId}] converting video for chromium -> ${path.basename(outPath)}`
+  );
 
   await runCmd(
     "ffmpeg",
     [
       "-y",
+
+      // iPhone MOV часто имеет edit-list и странные timestamps
+      "-fflags",
+      "+genpts",
+      "-ignore_editlist",
+      "1",
+
       "-i",
       inputPath,
 
-      // делаем предсказуемый CFR под FPS проекта
-      "-vf",
-      `fps=${OUTPUT_FPS}`,
-      "-r",
-      String(OUTPUT_FPS),
+      // CFR под fps проекта
       "-vsync",
       "cfr",
+      "-r",
+      String(OUTPUT_FPS),
 
+      // video
       "-c:v",
       "libx264",
       "-preset",
       "veryfast",
       "-crf",
-      "23",
+      "20",
       "-pix_fmt",
       "yuv420p",
-      "-movflags",
-      "+faststart",
+      "-video_track_timescale",
+      "90000",
 
+      // audio
       "-c:a",
       "aac",
       "-b:a",
-      "128k",
+      "160k",
       "-ar",
       "48000",
+      "-af",
+      "aresample=async=1:first_pts=0",
+
+      // timestamps / container
+      "-avoid_negative_ts",
+      "make_zero",
+      "-movflags",
+      "+faststart",
 
       outPath,
     ],
-    { timeoutMs: 10 * 60 * 1000 }
+    { timeoutMs: 12 * 60 * 1000 }
   );
 
   const stat = fs.statSync(outPath);
@@ -317,7 +329,8 @@ async function cleanupOldJobs() {
 
   for (const [id, job] of JOBS.entries()) {
     const age = now - job.createdAt;
-    const canDelete = age > ttlMs && (job.status === "done" || job.status === "error");
+    const canDelete =
+      age > ttlMs && (job.status === "done" || job.status === "error");
     if (!canDelete) continue;
 
     try {
@@ -355,7 +368,10 @@ async function processJob(jobId) {
     const serve = await getBundle();
 
     // 1) download sources (важно: даём норм расширение)
-    const localVideoPath = path.join(os.tmpdir(), `job-${jobId}-video-source.mp4`);
+    const localVideoPath = path.join(
+      os.tmpdir(),
+      `job-${jobId}-video-source.mp4`
+    );
     await downloadFromDrive(job.payload.videoFileId, localVideoPath);
 
     let localMusic = null;
@@ -439,7 +455,6 @@ async function processJob(jobId) {
         ],
       },
 
-      // скорость
       concurrency: Math.max(1, Math.min(RENDER_CONCURRENCY, os.cpus().length)),
       offthreadVideoCacheSizeInBytes: OFFTHREAD_CACHE_MB * 1024 * 1024,
 
@@ -475,7 +490,9 @@ async function processJob(jobId) {
     job.updatedAtIso = nowIso();
 
     console.log(
-      `[job ${jobId}] done in ${Math.round((job.finishedAt - job.startedAt) / 1000)}s`
+      `[job ${jobId}] done in ${Math.round(
+        (job.finishedAt - job.startedAt) / 1000
+      )}s`
     );
   } catch (e) {
     job.status = "error";
@@ -589,6 +606,8 @@ app.get("/download/:jobId", (req, res) => {
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`Remotion renderer async running on ${PORT}`);
   console.log(`COMPOSITION_ID=${COMPOSITION_ID}, OUTPUT_FPS=${OUTPUT_FPS}`);
-  console.log(`RENDER_CONCURRENCY=${RENDER_CONCURRENCY}, OFFTHREAD_CACHE_MB=${OFFTHREAD_CACHE_MB}`);
+  console.log(
+    `RENDER_CONCURRENCY=${RENDER_CONCURRENCY}, OFFTHREAD_CACHE_MB=${OFFTHREAD_CACHE_MB}`
+  );
   console.log(`ENABLE_CHROMIUM_FIX=${ENABLE_CHROMIUM_FIX}`);
 });
