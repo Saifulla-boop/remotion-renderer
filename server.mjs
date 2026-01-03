@@ -668,7 +668,8 @@ app.post("/render", (req, res) => {
       assetToken: null,
     });
 
-    setImmediate(() => processJob(jobId));
+    QUEUE.push(jobId);
+kickQueue();
 
     return res.json({ ok: true, jobId });
   } catch (e) {
