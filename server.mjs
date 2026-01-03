@@ -28,7 +28,7 @@ const MAX_SEC = 30;
 const RENDER_CONCURRENCY = Number(process.env.RENDER_CONCURRENCY || 2);
 const OFFTHREAD_CACHE_MB = Number(process.env.OFFTHREAD_CACHE_MB || 512);
 
-// Шаг 2: минимальная конвертация “для Chromium”
+// Шаг 2: минимальная конвертация “для Chromium” (но с анти-фризами)
 const ENABLE_CHROMIUM_FIX = (process.env.ENABLE_CHROMIUM_FIX ?? "1") !== "0";
 
 // -------------------- helpers --------------------
@@ -76,6 +76,25 @@ function runCmd(cmd, args, { timeoutMs } = {}) {
       reject(new Error(`${cmd} exited ${code}\n${(err || out).slice(-4000)}`));
     });
   });
+}
+
+async function logFps(label, filePath) {
+  try {
+    const { out } = await runCmd("ffprobe", [
+      "-v",
+      "error",
+      "-select_streams",
+      "v:0",
+      "-show_entries",
+      "stream=avg_frame_rate,r_frame_rate,time_base,codec_name,pix_fmt",
+      "-of",
+      "json",
+      filePath,
+    ]);
+    console.log(label, out);
+  } catch (e) {
+    console.log(label, "ffprobe failed:", String(e?.message || e));
+  }
 }
 
 // -------------------- Drive (Service Account, READONLY) --------------------
@@ -202,63 +221,26 @@ async function getBundle() {
   return serveUrl;
 }
 
-// -------------------- STEP 2: Minimal “fix for Chromium” --------------------
-async function probeVideo(filePath) {
-  const { out } = await runCmd("ffprobe", [
-    "-v",
-    "error",
-    "-print_format",
-    "json",
-    "-show_format",
-    "-show_streams",
-    filePath,
-  ]);
-  return JSON.parse(out);
-}
-
-function isChromiumFriendly(info) {
-  const streams = info?.streams || [];
-  const v = streams.find((s) => s.codec_type === "video");
-  const a = streams.find((s) => s.codec_type === "audio");
-  const fmt = info?.format?.format_name || "";
-
-  const containerOk =
-    fmt.includes("mp4") || fmt.includes("mov,mp4,m4a,3gp,3g2,mj2");
-
-  const vCodecOk = v?.codec_name === "h264";
-  const pixOk = (v?.pix_fmt || "").includes("yuv420p");
-  const aOk = !a || a.codec_name === "aac" || a.codec_name === "mp3";
-
-  return containerOk && vCodecOk && pixOk && aOk;
-}
-
+// -------------------- STEP 2: Anti-freeze normalize for iPhone MOV --------------------
 /**
- * ШАГ 2: трогаем файл только если НЕ chromium-friendly.
- * Конвертация с флагами, которые лечат iPhone MOV (edit list / pts):
- * -ignore_editlist 1, +genpts, make_zero, timescale
- * CFR под OUTPUT_FPS (лучше ставить OUTPUT_FPS=60 для айфона)
+ * Главная причина рандомных фризов:
+ * - VFR/кривые timestamps/edit-list в iPhone MOV
+ * Решение:
+ * - пересобрать PTS: -fflags +genpts + -ignore_editlist 1 + avoid_negative_ts
+ * - сделать жесткий CFR: fps=OUTPUT_FPS + -fps_mode cfr
+ * - нормальный timebase: -video_track_timescale (fps*1000 или 60000 для 60fps)
+ * - audio async, чтобы таймлайн не "плыл"
  */
 async function ensureVideoForChromium(inputPath, jobId) {
   if (!ENABLE_CHROMIUM_FIX) return inputPath;
 
-  let info = null;
-  try {
-    info = await probeVideo(inputPath);
-  } catch (e) {
-    console.log(
-      `[job ${jobId}] ffprobe failed, will convert anyway:`,
-      String(e?.message || e)
-    );
-  }
+  const targetFps = OUTPUT_FPS; // ставь env OUTPUT_FPS=60
+  const timescale = targetFps === 60 ? 60000 : 90000; // 60k идеально ложится на 60fps
 
-  if (info && isChromiumFriendly(info)) {
-    console.log(`[job ${jobId}] video already chromium-friendly, skip convert`);
-    return inputPath;
-  }
+  const outPath = inputPath.replace(/\.[^.]+$/, "") + `-cfr${targetFps}.mp4`;
 
-  const outPath = inputPath.replace(/\.[^.]+$/, "") + `-chromium.mp4`;
   console.log(
-    `[job ${jobId}] converting video for chromium -> ${path.basename(outPath)}`
+    `[job ${jobId}] normalize iPhone/VFR -> ${path.basename(outPath)} (fps=${targetFps})`
   );
 
   await runCmd(
@@ -266,7 +248,7 @@ async function ensureVideoForChromium(inputPath, jobId) {
     [
       "-y",
 
-      // iPhone MOV часто имеет edit-list и странные timestamps
+      // чинит PTS/edit list (iPhone MOV)
       "-fflags",
       "+genpts",
       "-ignore_editlist",
@@ -275,13 +257,13 @@ async function ensureVideoForChromium(inputPath, jobId) {
       "-i",
       inputPath,
 
-      // CFR под fps проекта
-      "-vsync",
+      // Жесткий CFR
+      "-vf",
+      `fps=${targetFps},format=yuv420p`,
+      "-fps_mode",
       "cfr",
-      "-r",
-      String(OUTPUT_FPS),
 
-      // video
+      // video encode
       "-c:v",
       "libx264",
       "-preset",
@@ -290,20 +272,29 @@ async function ensureVideoForChromium(inputPath, jobId) {
       "20",
       "-pix_fmt",
       "yuv420p",
-      "-video_track_timescale",
-      "90000",
 
-      // audio
+      // ровный GOP (иногда убирает микро-дергания при декоде)
+      "-g",
+      String(targetFps * 2),
+      "-keyint_min",
+      String(targetFps * 2),
+      "-sc_threshold",
+      "0",
+
+      "-video_track_timescale",
+      String(timescale),
+
+      // audio (даже если его нет — ffmpeg просто пропустит)
       "-c:a",
       "aac",
       "-b:a",
-      "160k",
+      "192k",
       "-ar",
       "48000",
       "-af",
       "aresample=async=1:first_pts=0",
 
-      // timestamps / container
+      // timestamps/container
       "-avoid_negative_ts",
       "make_zero",
       "-movflags",
@@ -311,7 +302,7 @@ async function ensureVideoForChromium(inputPath, jobId) {
 
       outPath,
     ],
-    { timeoutMs: 12 * 60 * 1000 }
+    { timeoutMs: 15 * 60 * 1000 }
   );
 
   const stat = fs.statSync(outPath);
@@ -362,12 +353,12 @@ async function processJob(jobId) {
   job.progress = 0;
   job.updatedAtIso = nowIso();
 
-  console.log(`[job ${jobId}] start`);
+  console.log(`[job ${jobId}] start (OUTPUT_FPS=${OUTPUT_FPS})`);
 
   try {
     const serve = await getBundle();
 
-    // 1) download sources (важно: даём норм расширение)
+    // 1) download sources
     const localVideoPath = path.join(
       os.tmpdir(),
       `job-${jobId}-video-source.mp4`
@@ -383,9 +374,13 @@ async function processJob(jobId) {
     job.localVideo = localVideoPath;
     job.localMusic = localMusic;
 
-    // 2) STEP 2: minimal chromium fix (конвертация только если нужно)
+    await logFps(`[job ${jobId}] [src]`, localVideoPath);
+
+    // 2) STEP 2: anti-freeze normalize
     const localVideoFixed = await ensureVideoForChromium(localVideoPath, jobId);
     job.localVideoFixed = localVideoFixed;
+
+    await logFps(`[job ${jobId}] [fixed]`, localVideoFixed);
 
     // 3) register assets
     const assetToken = registerAssets({
@@ -484,6 +479,8 @@ async function processJob(jobId) {
     const stat = fs.statSync(outPath);
     if (!stat.size || stat.size < 1024) throw new Error("Output mp4 is too small");
 
+    await logFps(`[job ${jobId}] [out]`, outPath);
+
     job.status = "done";
     job.finishedAt = Date.now();
     job.progress = 1;
@@ -551,7 +548,8 @@ app.post("/render", (req, res) => {
         musicFileId: musicFileId ? String(musicFileId) : "",
 
         videoVolume: typeof body.videoVolume === "number" ? body.videoVolume : 1,
-        musicVolume: typeof body.musicVolume === "number" ? body.musicVolume : 0.35,
+        musicVolume:
+          typeof body.musicVolume === "number" ? body.musicVolume : 0.35,
       },
 
       startedAt: null,
@@ -599,7 +597,10 @@ app.get("/download/:jobId", (req, res) => {
   }
 
   res.setHeader("Content-Type", "video/mp4");
-  res.setHeader("Content-Disposition", `attachment; filename="short-${job.id}.mp4"`);
+  res.setHeader(
+    "Content-Disposition",
+    `attachment; filename="short-${job.id}.mp4"`
+  );
   fs.createReadStream(job.outPath).pipe(res);
 });
 
