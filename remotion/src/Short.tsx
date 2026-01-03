@@ -119,33 +119,6 @@ export const Short: React.FC<Props> = (props) => {
           </div>
         </AbsoluteFill>
       ) : null}
-
-      {/* DESCRIPTION */}
-      {description ? (
-        <AbsoluteFill
-          style={{
-            justifyContent: "flex-end",
-            alignItems: "center",
-            padding: 64,
-            textAlign: "center",
-            pointerEvents: "none",
-          }}
-        >
-          <div
-            style={{
-              maxWidth: "92%",
-              color: "rgba(255,255,255,0.85)",
-              fontSize: 30,
-              lineHeight: 1.35,
-              fontWeight: 400,
-              textShadow: "0 2px 16px rgba(0,0,0,0.6)",
-              whiteSpace: "pre-wrap",
-            }}
-          >
-            {description}
-          </div>
-        </AbsoluteFill>
-      ) : null}
     </AbsoluteFill>
   );
 };
