@@ -391,6 +391,25 @@ async function finalizeOutputMp4(inPath, jobId) {
 // -------------------- JOB QUEUE --------------------
 const JOBS = new Map(); // jobId -> job
 
+// ---- Render queue (чтобы Railway не умирал от параллельных рендеров) ----
+const MAX_PARALLEL_JOBS = Number(process.env.MAX_PARALLEL_JOBS || 1); // оставь 1
+const QUEUE = [];
+let RUNNING = 0;
+
+function kickQueue() {
+  while (RUNNING < MAX_PARALLEL_JOBS && QUEUE.length > 0) {
+    const nextJobId = QUEUE.shift();
+    RUNNING++;
+
+    processJob(nextJobId)
+      .catch(() => {})
+      .finally(() => {
+        RUNNING--;
+        kickQueue();
+      });
+  }
+}
+
 async function cleanupOldJobs() {
   const ttlMs = JOB_TTL_MIN * 60 * 1000;
   const now = Date.now();
