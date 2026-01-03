@@ -16,7 +16,9 @@ app.use(express.json({ limit: "10mb" }));
 // -------------------- CONFIG --------------------
 const PORT = Number(process.env.PORT || 3000);
 const COMPOSITION_ID = process.env.COMPOSITION_ID || "Short";
-const OUTPUT_FPS = Number(process.env.OUTPUT_FPS || 30);
+
+// iPhone 60fps -> дефолт 60 (если env не задан)
+const OUTPUT_FPS = Number(process.env.OUTPUT_FPS || 60);
 
 const JOB_TTL_MIN = Number(process.env.JOB_TTL_MIN || 60);
 const JOB_CLEANUP_EVERY_SEC = Number(process.env.JOB_CLEANUP_EVERY_SEC || 60);
@@ -24,29 +26,27 @@ const JOB_CLEANUP_EVERY_SEC = Number(process.env.JOB_CLEANUP_EVERY_SEC || 60);
 const MIN_SEC = 6;
 const MAX_SEC = 30;
 
-// Ускорение рендера
+// Ускорение рендера (Railway часто 2 vCPU)
 const RENDER_CONCURRENCY = Number(process.env.RENDER_CONCURRENCY || 2);
 const OFFTHREAD_CACHE_MB = Number(process.env.OFFTHREAD_CACHE_MB || 512);
 
-// Шаг 2: минимальная конвертация “для Chromium” (но с анти-фризами)
+// Нормализация iPhone MOV
 const ENABLE_CHROMIUM_FIX = (process.env.ENABLE_CHROMIUM_FIX ?? "1") !== "0";
 
 // -------------------- helpers --------------------
 function nowIso() {
   return new Date().toISOString();
 }
-
 function safeStr(x) {
   return typeof x === "string" ? x : "";
 }
-
 function newJobId() {
   return crypto.randomUUID
     ? crypto.randomUUID()
     : crypto.randomBytes(16).toString("hex");
 }
 
-// Один-единственный runner для команд (ffmpeg/ffprobe)
+// Один runner для команд
 function runCmd(cmd, args, { timeoutMs } = {}) {
   return new Promise((resolve, reject) => {
     const p = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"] });
@@ -166,7 +166,6 @@ setInterval(() => {
   }
 }, 60 * 1000);
 
-// Range support
 function addRangeSupport(req, res, filePath, contentType) {
   const stat = fs.statSync(filePath);
   const fileSize = stat.size;
@@ -222,33 +221,27 @@ async function getBundle() {
 }
 
 // -------------------- STEP 2: Anti-freeze normalize for iPhone MOV --------------------
-/**
- * Главная причина рандомных фризов:
- * - VFR/кривые timestamps/edit-list в iPhone MOV
- * Решение:
- * - пересобрать PTS: -fflags +genpts + -ignore_editlist 1 + avoid_negative_ts
- * - сделать жесткий CFR: fps=OUTPUT_FPS + -fps_mode cfr
- * - нормальный timebase: -video_track_timescale (fps*1000 или 60000 для 60fps)
- * - audio async, чтобы таймлайн не "плыл"
- */
 async function ensureVideoForChromium(inputPath, jobId) {
   if (!ENABLE_CHROMIUM_FIX) return inputPath;
 
-  const targetFps = OUTPUT_FPS; // ставь env OUTPUT_FPS=60
-  const timescale = targetFps === 60 ? 60000 : 90000; // 60k идеально ложится на 60fps
+  const targetFps = OUTPUT_FPS; // 60
+  const timescale = targetFps === 60 ? 60000 : 90000;
 
-  const outPath = inputPath.replace(/\.[^.]+$/, "") + `-cfr${targetFps}.mp4`;
+  const outPath = inputPath.replace(/\.[^.]+$/, "") + `-norm-${targetFps}.mp4`;
 
-  console.log(
-    `[job ${jobId}] normalize iPhone/VFR -> ${path.basename(outPath)} (fps=${targetFps})`
-  );
+  console.log(`[job ${jobId}] normalize -> ${path.basename(outPath)} (fps=${targetFps})`);
 
+  // ВАЖНО:
+  // -fflags +genpts и -ignore_editlist 1 лечат iPhone edit-list/PTS
+  // fps фильтр + fps_mode cfr делает жесткий CFR
   await runCmd(
     "ffmpeg",
     [
       "-y",
+      "-hide_banner",
+      "-loglevel",
+      "error",
 
-      // чинит PTS/edit list (iPhone MOV)
       "-fflags",
       "+genpts",
       "-ignore_editlist",
@@ -257,13 +250,13 @@ async function ensureVideoForChromium(inputPath, jobId) {
       "-i",
       inputPath,
 
-      // Жесткий CFR
+      // CFR + yuv420p
       "-vf",
       `fps=${targetFps},format=yuv420p`,
       "-fps_mode",
       "cfr",
 
-      // video encode
+      // h264
       "-c:v",
       "libx264",
       "-preset",
@@ -273,7 +266,7 @@ async function ensureVideoForChromium(inputPath, jobId) {
       "-pix_fmt",
       "yuv420p",
 
-      // ровный GOP (иногда убирает микро-дергания при декоде)
+      // Ровный GOP (для стабильного декода)
       "-g",
       String(targetFps * 2),
       "-keyint_min",
@@ -284,7 +277,7 @@ async function ensureVideoForChromium(inputPath, jobId) {
       "-video_track_timescale",
       String(timescale),
 
-      // audio (даже если его нет — ffmpeg просто пропустит)
+      // audio стабильный (если есть)
       "-c:a",
       "aac",
       "-b:a",
@@ -294,7 +287,6 @@ async function ensureVideoForChromium(inputPath, jobId) {
       "-af",
       "aresample=async=1:first_pts=0",
 
-      // timestamps/container
       "-avoid_negative_ts",
       "make_zero",
       "-movflags",
@@ -311,7 +303,51 @@ async function ensureVideoForChromium(inputPath, jobId) {
   return outPath;
 }
 
-// -------------------- JOB QUEUE (in-memory) --------------------
+// -------------------- FINAL PASS: force yuv420p (no yuvj420p) --------------------
+async function finalizeOutputMp4(inPath, jobId) {
+  const outPath = inPath.replace(/\.mp4$/, "") + "-final.mp4";
+  console.log(`[job ${jobId}] finalizing -> ${path.basename(outPath)}`);
+
+  await runCmd(
+    "ffmpeg",
+    [
+      "-y",
+      "-hide_banner",
+      "-loglevel",
+      "error",
+      "-i",
+      inPath,
+
+      "-c:v",
+      "libx264",
+      "-preset",
+      "veryfast",
+      "-crf",
+      "20",
+      "-pix_fmt",
+      "yuv420p",
+
+      "-c:a",
+      "aac",
+      "-b:a",
+      "192k",
+      "-ar",
+      "48000",
+
+      "-movflags",
+      "+faststart",
+      outPath,
+    ],
+    { timeoutMs: 10 * 60 * 1000 }
+  );
+
+  const stat = fs.statSync(outPath);
+  if (!stat.size || stat.size < 1024) throw new Error("Final mp4 is too small");
+
+  return outPath;
+}
+
+// -------------------- JOB QUEUE --------------------
 const JOBS = new Map(); // jobId -> job
 
 async function cleanupOldJobs() {
@@ -320,13 +356,15 @@ async function cleanupOldJobs() {
 
   for (const [id, job] of JOBS.entries()) {
     const age = now - job.createdAt;
-    const canDelete =
-      age > ttlMs && (job.status === "done" || job.status === "error");
+    const canDelete = age > ttlMs && (job.status === "done" || job.status === "error");
     if (!canDelete) continue;
 
     try {
       if (job.assetToken) cleanupToken(job.assetToken);
       if (job.outPath) await fsp.unlink(job.outPath).catch(() => {});
+      if (job.outPathFinal && job.outPathFinal !== job.outPath) {
+        await fsp.unlink(job.outPathFinal).catch(() => {});
+      }
       if (job.localVideo) await fsp.unlink(job.localVideo).catch(() => {});
       if (job.localVideoFixed && job.localVideoFixed !== job.localVideo) {
         await fsp.unlink(job.localVideoFixed).catch(() => {});
@@ -359,10 +397,7 @@ async function processJob(jobId) {
     const serve = await getBundle();
 
     // 1) download sources
-    const localVideoPath = path.join(
-      os.tmpdir(),
-      `job-${jobId}-video-source.mp4`
-    );
+    const localVideoPath = path.join(os.tmpdir(), `job-${jobId}-video-source.mp4`);
     await downloadFromDrive(job.payload.videoFileId, localVideoPath);
 
     let localMusic = null;
@@ -376,7 +411,7 @@ async function processJob(jobId) {
 
     await logFps(`[job ${jobId}] [src]`, localVideoPath);
 
-    // 2) STEP 2: anti-freeze normalize
+    // 2) normalize
     const localVideoFixed = await ensureVideoForChromium(localVideoPath, jobId);
     job.localVideoFixed = localVideoFixed;
 
@@ -393,7 +428,6 @@ async function processJob(jobId) {
     const videoUrl = `${baseUrl}/asset/${assetToken}/video`;
     const musicUrl = localMusic ? `${baseUrl}/asset/${assetToken}/music` : "";
 
-    // 4) inputProps
     const inputProps = {
       hook: safeStr(job.payload.hook),
       description: safeStr(job.payload.description),
@@ -412,20 +446,17 @@ async function processJob(jobId) {
       musicVolume: job.payload.musicVolume,
     };
 
-    // 5) select composition
     const composition = await selectComposition({
       serveUrl: serve,
       id: COMPOSITION_ID,
       inputProps,
     });
 
-    // 6) output
     const outPath = path.join(os.tmpdir(), `job-${jobId}-out.mp4`);
     job.outPath = outPath;
 
     const durationInFrames = Math.round(job.payload.durationSec * OUTPUT_FPS);
 
-    // 7) render
     let lastLog = 0;
 
     await renderMedia({
@@ -481,16 +512,19 @@ async function processJob(jobId) {
 
     await logFps(`[job ${jobId}] [out]`, outPath);
 
+    // 8) FINAL PASS (убираем yuvj420p и делаем максимально “телеграмный” mp4)
+    const finalPath = await finalizeOutputMp4(outPath, jobId);
+    job.outPathFinal = finalPath;
+    job.outPath = finalPath;
+
+    await logFps(`[job ${jobId}] [final]`, finalPath);
+
     job.status = "done";
     job.finishedAt = Date.now();
     job.progress = 1;
     job.updatedAtIso = nowIso();
 
-    console.log(
-      `[job ${jobId}] done in ${Math.round(
-        (job.finishedAt - job.startedAt) / 1000
-      )}s`
-    );
+    console.log(`[job ${jobId}] done in ${Math.round((job.finishedAt - job.startedAt) / 1000)}s`);
   } catch (e) {
     job.status = "error";
     job.error = String(e?.message || e);
@@ -548,13 +582,13 @@ app.post("/render", (req, res) => {
         musicFileId: musicFileId ? String(musicFileId) : "",
 
         videoVolume: typeof body.videoVolume === "number" ? body.videoVolume : 1,
-        musicVolume:
-          typeof body.musicVolume === "number" ? body.musicVolume : 0.35,
+        musicVolume: typeof body.musicVolume === "number" ? body.musicVolume : 0.35,
       },
 
       startedAt: null,
       finishedAt: null,
       outPath: null,
+      outPathFinal: null,
       localVideo: null,
       localVideoFixed: null,
       localMusic: null,
@@ -597,18 +631,13 @@ app.get("/download/:jobId", (req, res) => {
   }
 
   res.setHeader("Content-Type", "video/mp4");
-  res.setHeader(
-    "Content-Disposition",
-    `attachment; filename="short-${job.id}.mp4"`
-  );
+  res.setHeader("Content-Disposition", `attachment; filename="short-${job.id}.mp4"`);
   fs.createReadStream(job.outPath).pipe(res);
 });
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`Remotion renderer async running on ${PORT}`);
   console.log(`COMPOSITION_ID=${COMPOSITION_ID}, OUTPUT_FPS=${OUTPUT_FPS}`);
-  console.log(
-    `RENDER_CONCURRENCY=${RENDER_CONCURRENCY}, OFFTHREAD_CACHE_MB=${OFFTHREAD_CACHE_MB}`
-  );
+  console.log(`RENDER_CONCURRENCY=${RENDER_CONCURRENCY}, OFFTHREAD_CACHE_MB=${OFFTHREAD_CACHE_MB}`);
   console.log(`ENABLE_CHROMIUM_FIX=${ENABLE_CHROMIUM_FIX}`);
 });
