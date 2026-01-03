@@ -645,6 +645,11 @@ app.get("/status/:jobId", (req, res) => {
     error: job.error,
     createdAt: job.createdAtIso,
     updatedAt: job.updatedAtIso,
+
+    hook: job?.payload?.hook || "",
+    description: job?.payload?.description || "",
+    videoFileId: job?.payload?.videoFileId || "",
+    musicFileId: job?.payload?.musicFileId || "",
   });
 });
 
