@@ -96,6 +96,23 @@ async function logFps(label, filePath) {
     console.log(label, "ffprobe failed:", String(e?.message || e));
   }
 }
+async function getDurationSec(filePath) {
+  const { out } = await runCmd("ffprobe", [
+    "-v",
+    "error",
+    "-show_entries",
+    "format=duration",
+    "-of",
+    "default=noprint_wrappers=1:nokey=1",
+    filePath,
+  ]);
+
+  const sec = Number(String(out).trim());
+  if (!Number.isFinite(sec) || sec <= 0) {
+    throw new Error(`ffprobe duration invalid: "${out}"`);
+  }
+  return sec;
+}
 
 // -------------------- Drive (Service Account, READONLY) --------------------
 function getDrive() {
@@ -417,6 +434,19 @@ async function processJob(jobId) {
 
     await logFps(`[job ${jobId}] [fixed]`, localVideoFixed);
 
+    // === VARIANT A: duration берём из нормализованного видео ===
+const realDuration = await getDurationSec(localVideoFixed);
+
+// clamp в допустимые рамки
+const durationSec = Math.min(Math.max(realDuration, MIN_SEC), MAX_SEC);
+
+// сохраняем (чтобы /status показывал корректную длительность)
+job.payload.durationSec = durationSec;
+
+console.log(
+  `[job ${jobId}] duration from video: ${realDuration.toFixed(2)}s -> used ${durationSec}s`
+);
+
     // 3) register assets
     const assetToken = registerAssets({
       videoPath: localVideoFixed,
@@ -455,7 +485,7 @@ async function processJob(jobId) {
     const outPath = path.join(os.tmpdir(), `job-${jobId}-out.mp4`);
     job.outPath = outPath;
 
-    const durationInFrames = Math.round(job.payload.durationSec * OUTPUT_FPS);
+    const durationInFrames = Math.round(durationSec * OUTPUT_FPS);
 
     let lastLog = 0;
 
