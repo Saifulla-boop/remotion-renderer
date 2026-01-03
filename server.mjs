@@ -78,6 +78,35 @@ function runCmd(cmd, args, { timeoutMs } = {}) {
   });
 }
 
+function stripArg(args, flag) {
+  const out = [];
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === flag) {
+      const next = args[i + 1];
+      if (next && !String(next).startsWith("-")) i++; // пропускаем значение флага
+      continue;
+    }
+    out.push(args[i]);
+  }
+  return out;
+}
+
+async function runFfmpegWithFallback(args, { timeoutMs, jobId } = {}) {
+  try {
+    return await runCmd("ffmpeg", args, { timeoutMs });
+  } catch (e) {
+    const msg = String(e?.message || e);
+
+    if (msg.includes("Option ignore_editlist not found")) {
+      console.log(`[job ${jobId}] ffmpeg has no -ignore_editlist, retrying without it`);
+      const args2 = stripArg(args, "-ignore_editlist");
+      return await runCmd("ffmpeg", args2, { timeoutMs });
+    }
+
+    throw e;
+  }
+}
+
 async function logFps(label, filePath) {
   try {
     const { out } = await runCmd("ffprobe", [
@@ -251,8 +280,7 @@ async function ensureVideoForChromium(inputPath, jobId) {
   // ВАЖНО:
   // -fflags +genpts и -ignore_editlist 1 лечат iPhone edit-list/PTS
   // fps фильтр + fps_mode cfr делает жесткий CFR
-  await runCmd(
-    "ffmpeg",
+    await runFfmpegWithFallback(
     [
       "-y",
       "-hide_banner",
@@ -267,13 +295,11 @@ async function ensureVideoForChromium(inputPath, jobId) {
       "-i",
       inputPath,
 
-      // CFR + yuv420p
       "-vf",
       `fps=${targetFps},format=yuv420p`,
       "-fps_mode",
       "cfr",
 
-      // h264
       "-c:v",
       "libx264",
       "-preset",
@@ -283,7 +309,6 @@ async function ensureVideoForChromium(inputPath, jobId) {
       "-pix_fmt",
       "yuv420p",
 
-      // Ровный GOP (для стабильного декода)
       "-g",
       String(targetFps * 2),
       "-keyint_min",
@@ -294,7 +319,6 @@ async function ensureVideoForChromium(inputPath, jobId) {
       "-video_track_timescale",
       String(timescale),
 
-      // audio стабильный (если есть)
       "-c:a",
       "aac",
       "-b:a",
@@ -311,7 +335,7 @@ async function ensureVideoForChromium(inputPath, jobId) {
 
       outPath,
     ],
-    { timeoutMs: 15 * 60 * 1000 }
+    { timeoutMs: 15 * 60 * 1000, jobId }
   );
 
   const stat = fs.statSync(outPath);
