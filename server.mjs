@@ -13,6 +13,10 @@ import { google } from "googleapis";
 const app = express();
 app.use(express.json({ limit: "10mb" }));
 
+// Раздаём remotion/public как статику (чтобы шрифты всегда находились)
+app.use("/fonts", express.static(path.join(process.cwd(), "remotion", "public", "fonts")));
+app.use("/public/fonts", express.static(path.join(process.cwd(), "remotion", "public", "fonts")));
+
 // Раздаём remotion staticFile() (шрифты, картинки и т.д.)
 app.use(
   "/public",
