@@ -5,6 +5,13 @@ import { Short } from "./Short";
 const fontCss = `
 @font-face {
   font-family: "Montserrat";
+  src: url("${staticFile("fonts/Montserrat-Thin.ttf")}") format("truetype");
+  font-weight: 200;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Montserrat";
   src: url("${staticFile("fonts/Montserrat-Regular.ttf")}") format("truetype");
   font-weight: 400;
   font-style: normal;
