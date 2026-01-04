@@ -295,8 +295,8 @@ async function ensureVideoForChromium(inputPath, jobId) {
       "-i",
       inputPath,
 
-      "-vf",
-      `fps=${targetFps},format=yuv420p`,
+    "-vf",
+`fps=${targetFps},pad=ceil(iw/2)*2:ceil(ih/2)*2,format=yuv420p`,
       "-fps_mode",
       "cfr",
 
@@ -358,6 +358,9 @@ async function finalizeOutputMp4(inPath, jobId) {
       "error",
       "-i",
       inPath,
+
+      "-vf",
+"pad=ceil(iw/2)*2:ceil(ih/2)*2,format=yuv420p",
 
       "-c:v",
       "libx264",
