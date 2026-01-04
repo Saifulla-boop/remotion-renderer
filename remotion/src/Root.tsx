@@ -6,7 +6,7 @@ const fontCss = `
 @font-face {
   font-family: "Montserrat";
   src: url("${staticFile("fonts/Montserrat-Thin.ttf")}") format("truetype");
-  font-weight: 200;
+  font-weight: 100;
   font-style: normal;
   font-display: swap;
 }
