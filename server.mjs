@@ -23,6 +23,14 @@ try {
 const app = express();
 app.use(express.json({ limit: "10mb" }));
 
+app.get("/public/fonts/:file", (req, res) => {
+  const filePath = path.join(process.cwd(), "remotion", "public", "fonts", req.params.file);
+  const exists = fs.existsSync(filePath);
+  console.log("[fonts]", req.params.file, "->", filePath, "exists:", exists);
+  if (!exists) return res.status(404).send("font not found: " + req.params.file);
+  return res.sendFile(filePath);
+});
+
 // Раздаём remotion/public как статику (чтобы шрифты всегда находились)
 app.use("/fonts", express.static(path.join(process.cwd(), "remotion", "public", "fonts")));
 app.use("/public/fonts", express.static(path.join(process.cwd(), "remotion", "public", "fonts")));
