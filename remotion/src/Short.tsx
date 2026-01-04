@@ -30,7 +30,6 @@ export const Short: React.FC<Props> = (props) => {
   const frame = useCurrentFrame();
 
   const hook = props.hook ?? "";
-  const description = props.description ?? "";
 
   const videoSrc = props.videoUrl ?? props.videoSrc ?? props.videoPath ?? "";
   const musicSrc = props.musicUrl ?? props.musicSrc ?? props.musicPath ?? "";
@@ -44,7 +43,6 @@ export const Short: React.FC<Props> = (props) => {
   const musicVolumeBase =
     typeof props.musicVolume === "number" ? props.musicVolume : 0.35;
 
-  // Лёгкий fade музыки (чтобы не рубило по ушам, и избегаем резких артефактов)
   const musicVolume = useMemo(() => {
     const fadeIn = interpolate(frame, [0, Math.round(fps * 0.35)], [0, 1], {
       extrapolateRight: "clamp",
@@ -62,7 +60,6 @@ export const Short: React.FC<Props> = (props) => {
     <AbsoluteFill
       style={{
         backgroundColor: "black",
-        // Montserrat теперь берется из Root.tsx (локальный @font-face)
         fontFamily: "Montserrat, Arial, sans-serif",
       }}
     >
@@ -74,45 +71,42 @@ export const Short: React.FC<Props> = (props) => {
           style={{
             width,
             height,
-            objectFit: "contain", // no stretch
+            objectFit: "contain",
           }}
         />
       </AbsoluteFill>
 
-      {/* DIM OVERLAY */}
+      {/* DIM OVERLAY (30–40%) */}
       <AbsoluteFill
         style={{
-          backgroundColor: "rgba(0,0,0,0.25)",
+          backgroundColor: "rgba(0,0,0,0.35)", // было 0.25
         }}
       />
 
       {/* MUSIC */}
       {musicSrc ? <Audio src={musicSrc} volume={musicVolume} /> : null}
 
-      {/* HOOK BOX */}
+      {/* HOOK (без плашки) */}
       {hook ? (
         <AbsoluteFill
           style={{
             justifyContent: "center",
             alignItems: "center",
-            padding: 64,
+            padding: 80,
             textAlign: "center",
             pointerEvents: "none",
           }}
         >
           <div
             style={{
-              background: "rgba(170, 92, 40, 0.72)",
-              borderRadius: 22,
-              padding: "26px 34px",
               maxWidth: "92%",
-              color: "rgba(255,255,255,0.92)",
-              fontSize: 56,
-              lineHeight: 1.15,
-              fontWeight: 600,
+              color: "rgba(255,255,255,0.88)",
+              fontSize: 54,
+              lineHeight: 1.12,
+              fontWeight: 200, // Montserrat Thin
               letterSpacing: 0.2,
-              backdropFilter: "blur(6px)",
-              WebkitBackdropFilter: "blur(6px)",
+              textShadow: "0 10px 30px rgba(0,0,0,0.55)",
+              whiteSpace: "pre-wrap",
             }}
           >
             {hook}
