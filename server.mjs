@@ -13,6 +13,12 @@ import { google } from "googleapis";
 const app = express();
 app.use(express.json({ limit: "10mb" }));
 
+// Раздаём remotion staticFile() (шрифты, картинки и т.д.)
+app.use(
+  "/public",
+  express.static(path.join(process.cwd(), "remotion", "public"))
+);
+
 // -------------------- CONFIG --------------------
 const PORT = Number(process.env.PORT || 3000);
 const COMPOSITION_ID = process.env.COMPOSITION_ID || "Short";
