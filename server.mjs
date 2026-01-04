@@ -23,6 +23,28 @@ try {
 const app = express();
 app.use(express.json({ limit: "10mb" }));
 
+// ✅ раздаём remotion/public как /public (нужно для staticFile())
+app.use(
+  "/public",
+  express.static(path.join(process.cwd(), "remotion", "public"))
+);
+
+// ✅ дебаг: проверка что файл виден
+app.get("/_debug/fonts", (req, res) => {
+  const filePath = path.join(
+    process.cwd(),
+    "remotion",
+    "public",
+    "fonts",
+    "Montserrat-Thin.ttf"
+  );
+
+  res.json({
+    exists: fs.existsSync(filePath),
+    path: filePath,
+  });
+});
+
 app.get("/public/fonts/:file", (req, res) => {
   const filePath = path.join(process.cwd(), "remotion", "public", "fonts", req.params.file);
   const exists = fs.existsSync(filePath);
