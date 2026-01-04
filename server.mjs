@@ -10,6 +10,16 @@ import { bundle } from "@remotion/bundler";
 import { renderMedia, selectComposition } from "@remotion/renderer";
 import { google } from "googleapis";
 
+const fontsDir = path.join(process.cwd(), "remotion", "public", "fonts");
+console.log("[boot] cwd:", process.cwd());
+console.log("[boot] fontsDir:", fontsDir);
+try {
+  const files = fs.readdirSync(fontsDir);
+  console.log("[boot] fonts files:", files);
+} catch (e) {
+  console.log("[boot] fontsDir read failed:", String(e?.message || e));
+}
+
 const app = express();
 app.use(express.json({ limit: "10mb" }));
 
