@@ -509,6 +509,9 @@ async function processJob(jobId) {
   try {
     const serve = await getBundle();
 
+    const publicDir = path.join(process.cwd(), "remotion", "public");
+console.log("[remotion] publicDir:", publicDir);
+
     // 1) download sources
     const localVideoPath = path.join(os.tmpdir(), `job-${jobId}-video-source.mp4`);
     await downloadFromDrive(job.payload.videoFileId, localVideoPath);
@@ -573,10 +576,11 @@ console.log(
     };
 
     const composition = await selectComposition({
-      serveUrl: serve,
-      id: COMPOSITION_ID,
-      inputProps,
-    });
+  serveUrl: serve,
+  id: COMPOSITION_ID,
+  inputProps,
+  publicDir, // ✅ ВОТ ЭТО
+});
 
     const outPath = path.join(os.tmpdir(), `job-${jobId}-out.mp4`);
     job.outPath = outPath;
@@ -592,6 +596,7 @@ console.log(
         durationInFrames,
       },
       serveUrl: serve,
+  publicDir,
       codec: "h264",
       pixelFormat: "yuv420p",
       outputLocation: outPath,
