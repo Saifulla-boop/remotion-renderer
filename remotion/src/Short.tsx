@@ -38,10 +38,8 @@ export const Short: React.FC<Props> = (props) => {
     throw new Error("Short.tsx: video src is undefined. Check server inputProps.");
   }
 
-  const videoVolume =
-    typeof props.videoVolume === "number" ? props.videoVolume : 1;
-  const musicVolumeBase =
-    typeof props.musicVolume === "number" ? props.musicVolume : 0.35;
+  const videoVolume = typeof props.videoVolume === "number" ? props.videoVolume : 1;
+  const musicVolumeBase = typeof props.musicVolume === "number" ? props.musicVolume : 0.35;
 
   const musicVolume = useMemo(() => {
     const fadeIn = interpolate(frame, [0, Math.round(fps * 0.35)], [0, 1], {
@@ -79,7 +77,7 @@ export const Short: React.FC<Props> = (props) => {
       {/* DIM OVERLAY (30–40%) */}
       <AbsoluteFill
         style={{
-          backgroundColor: "rgba(0,0,0,0.45)",
+          backgroundColor: "rgba(0,0,0,0.4)", // 0.30–0.40 как просила
         }}
       />
 
@@ -103,10 +101,11 @@ export const Short: React.FC<Props> = (props) => {
               color: "rgba(255,255,255,0.88)",
               fontSize: 54,
               lineHeight: 1.12,
-              fontWeight: 300, // ← нужная толщина
+              fontWeight: 300, // будет работать ТОЛЬКО если подключен Montserrat Light (300)
               letterSpacing: 0.2,
               textShadow: "0 10px 30px rgba(0,0,0,0.55)",
               whiteSpace: "pre-wrap",
+              WebkitFontSmoothing: "antialiased",
             }}
           >
             {hook}
