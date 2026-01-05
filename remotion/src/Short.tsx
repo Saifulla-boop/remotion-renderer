@@ -79,9 +79,9 @@ export const Short: React.FC<Props> = (props) => {
       {/* DIM OVERLAY (30–40%) */}
       <AbsoluteFill
         style={{
-          backgroundColor: "rgba(0,0,0,0.35)", // было 0.25
+          backgroundColor: "rgba(0,0,0,0.45)", // было 0.25
         }}
-      />
+      /
 
       {/* MUSIC */}
       {musicSrc ? <Audio src={musicSrc} volume={musicVolume} /> : null}
@@ -103,7 +103,7 @@ export const Short: React.FC<Props> = (props) => {
               color: "rgba(255,255,255,0.88)",
               fontSize: 54,
               lineHeight: 1.12,
-              fontWeight: 200, // Montserrat Thin
+              fontWeight: 300, // Montserrat Thin
               letterSpacing: 0.2,
               textShadow: "0 10px 30px rgba(0,0,0,0.55)",
               whiteSpace: "pre-wrap",
